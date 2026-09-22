@@ -28,7 +28,16 @@ def _connect(dsn: str):
         raise PostgresUnavailable(
             "DB_BACKEND=postgres requires psycopg: pip install 'psycopg[binary]'"
         ) from exc
-    return psycopg.connect(dsn, autocommit=True, connect_timeout=10)
+    # prepare_threshold=None disables psycopg's automatic server-side
+    # prepared statements. Required when connecting through Supabase's
+    # transaction-mode pooler (port 6543): pgbouncer/Supavisor can route
+    # each query to a different physical backend connection, so a
+    # prepared statement psycopg thinks it just created can collide with
+    # one another session already created on that same backend --
+    # surfacing as psycopg.errors.DuplicatePreparedStatement. See
+    # https://www.psycopg.org/psycopg3/docs/advanced/prepare.html
+    return psycopg.connect(dsn, autocommit=True, connect_timeout=10,
+                            prepare_threshold=None)
 
 
 class PostgresDatabase:
