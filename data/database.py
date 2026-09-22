@@ -15,7 +15,7 @@ import sqlite3
 import time
 from pathlib import Path
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
@@ -170,6 +170,27 @@ class Database:
             if col not in existing:
                 self.conn.execute(
                     f"ALTER TABLE rejected_signals ADD COLUMN {col} {decl}")
+
+        # v2 -> v3: main.py now persists candles seeded from tick_history on
+        # startup, not just ones closed during the live loop -- and every
+        # restart re-seeds from the last 5000 ticks, which overlaps candles
+        # already saved from before the restart. Without a uniqueness
+        # guard, that duplicates rows on every redeploy, and duplicate rows
+        # corrupt reconcile_rejected_signals()'s "N candles later" query,
+        # which counts ROWS, not distinct closes. Dedup first -- a pre-fix
+        # deployment may already have written some via the live loop across
+        # restarts of a different kind -- THEN add the index; the other
+        # order raises a UNIQUE violation on the very duplicates being
+        # fixed. Both steps are safe to run again on every startup: dedup
+        # deletes nothing once there are no duplicates, and IF NOT EXISTS
+        # skips index creation once it exists.
+        self.conn.execute(
+            "DELETE FROM candles WHERE id NOT IN "
+            "(SELECT MIN(id) FROM candles GROUP BY symbol, close_epoch)")
+        self.conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_candles_unique "
+            "ON candles(symbol, close_epoch)")
+
         row = self.conn.execute("SELECT version FROM schema_version LIMIT 1").fetchone()
         if row is None:
             self.conn.execute("INSERT INTO schema_version(version) VALUES (?)",
@@ -191,8 +212,13 @@ class Database:
     # -- writes ---------------------------------------------------------
 
     def record_candle(self, c) -> int:
+        # INSERT OR IGNORE against idx_candles_unique (symbol, close_epoch):
+        # main.py seeds candles from tick_history on every startup, which
+        # overlaps whatever was already persisted before a restart. This is
+        # what makes calling it again on the same candle a no-op instead of
+        # a duplicate row -- see _migrate()'s v3 comment for why that matters.
         cur = self.conn.execute(
-            """INSERT INTO candles (symbol, timeframe_seconds, open_epoch,
+            """INSERT OR IGNORE INTO candles (symbol, timeframe_seconds, open_epoch,
                close_epoch, open, high, low, close, n_ticks, has_volume)
                VALUES (?,?,?,?,?,?,?,?,?,?)""",
             (c.symbol, c.timeframe_seconds, c.open_epoch, c.close_epoch,
@@ -225,6 +251,44 @@ class Database:
                  decision.reason_code, direction))
         self.conn.commit()
         return signal_id
+
+    def update_signal_outcome(self, signal_id: int, decision) -> None:
+        """Corrects the row record_signal() wrote BEFORE execute_trade ran.
+
+        record_signal() is called with the signal-level decision -- before a
+        proposal is even fetched -- because trades.signal_id needs a real
+        foreign key to point at, and that row has to exist before
+        execution can start. But a signal-level TRADE_BULLISH/TRADE_BEARISH
+        can still be downgraded afterward by economics, risk, a bad
+        proposal, or (in research mode) the research-mode gate itself --
+        and without this call, `signals` would permanently show a trade
+        that was never actually attempted. Called once, immediately after
+        execute_trade() returns, with whatever decision it settled on.
+
+        If the final decision is NO_TRADE, this also writes the
+        rejected_signals row record_signal() skipped (it only writes one
+        when the decision was ALREADY NO_TRADE at that earlier point) --
+        so a setup that qualified and confirmed but was refused by
+        economics or risk still lands in the counterfactual data, which is
+        exactly the kind of case Level 2 most needs to see: not just
+        "did the model's declines usually get skipped," but "was declining
+        THIS one correct."
+        """
+        self.conn.execute(
+            "UPDATE signals SET decision=?, reason_code=?, explanation=?, "
+            "payout_multiple=? WHERE id=?",
+            (decision.decision, decision.reason_code, decision.explanation,
+             decision.payout_multiple, signal_id))
+        if not decision.will_trade:
+            direction = ("bullish" if decision.bullish_score >= decision.bearish_score
+                        else "bearish")
+            self.conn.execute(
+                """INSERT INTO rejected_signals (signal_id, ts, symbol,
+                   reason_code, would_be_direction)
+                   VALUES (?,?,?,?,?)""",
+                (signal_id, decision.timestamp, decision.symbol,
+                 decision.reason_code, direction))
+        self.conn.commit()
 
     def record_regime(self, symbol: str, regime_snap, volatility_regime: str) -> None:
         self.conn.execute(

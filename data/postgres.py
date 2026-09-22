@@ -28,16 +28,7 @@ def _connect(dsn: str):
         raise PostgresUnavailable(
             "DB_BACKEND=postgres requires psycopg: pip install 'psycopg[binary]'"
         ) from exc
-    # prepare_threshold=None disables psycopg's automatic server-side
-    # prepared statements. Required when connecting through Supabase's
-    # transaction-mode pooler (port 6543): pgbouncer/Supavisor can route
-    # each query to a different physical backend connection, so a
-    # prepared statement psycopg thinks it just created can collide with
-    # one another session already created on that same backend --
-    # surfacing as psycopg.errors.DuplicatePreparedStatement. See
-    # https://www.psycopg.org/psycopg3/docs/advanced/prepare.html
-    return psycopg.connect(dsn, autocommit=True, connect_timeout=10,
-                            prepare_threshold=None)
+    return psycopg.connect(dsn, autocommit=True, connect_timeout=10)
 
 
 class PostgresDatabase:
@@ -116,6 +107,25 @@ class PostgresDatabase:
                      decision.reason_code, direction))
             return signal_id
 
+    def update_signal_outcome(self, signal_id: int, decision) -> None:
+        """Postgres mirror of data/database.Database.update_signal_outcome
+        -- see that docstring for why this exists and what it fixes."""
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                update signals set decision=%s, reason_code=%s, explanation=%s,
+                    payout_multiple=%s where id=%s""",
+                (decision.decision, decision.reason_code, decision.explanation,
+                 decision.payout_multiple, signal_id))
+            if not decision.will_trade:
+                direction = ("bullish" if decision.bullish_score >= decision.bearish_score
+                            else "bearish")
+                cur.execute("""
+                    insert into rejected_signals (signal_id, ts, symbol,
+                        reason_code, would_be_direction)
+                    values (%s,%s,%s,%s,%s)""",
+                    (signal_id, decision.timestamp, decision.symbol,
+                     decision.reason_code, direction))
+
     def record_trade_open(self, *, signal_id, symbol, contract_id, idempotency_key,
                           contract_type, stake, payout, buy_price, entry_spot) -> int:
         with self.conn.cursor() as cur:
@@ -136,11 +146,18 @@ class PostgresDatabase:
                 (won, pnl, exit_spot, time.time(), error, contract_id))
 
     def record_candle(self, c) -> None:
+        # ON CONFLICT (symbol, close_epoch) DO NOTHING -- matches the SQLite
+        # backend's INSERT OR IGNORE. Requires the unique index added in
+        # supabase/schema.sql; re-seeding candles from tick_history on every
+        # restart overlaps what a previous run already persisted, and
+        # without this, that duplicates rows and corrupts
+        # reconcile_rejected_signals()'s row-counted settlement lookup.
         with self.conn.cursor() as cur:
             cur.execute("""
                 insert into candles (symbol, timeframe_seconds, open_epoch,
                     close_epoch, open, high, low, close, n_ticks, has_volume)
-                values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                on conflict (symbol, close_epoch) do nothing""",
                 (c.symbol, c.timeframe_seconds, c.open_epoch, c.close_epoch,
                  c.open, c.high, c.low, c.close, c.n_ticks, c.has_volume))
 
