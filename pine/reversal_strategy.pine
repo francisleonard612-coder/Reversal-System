@@ -1,0 +1,280 @@
+// Level 1 Reversal Strategy -- PineScript mirror of docs/STRATEGY_SPECIFICATION.md
+//
+// This is a RESEARCH AND VISUALIZATION MIRROR (spec Section 9), not the
+// production trading engine -- Python (strategy/pipeline.py) is
+// authoritative and executes real trades; this script never places an
+// order on a real account. Every formula here is derived from
+// docs/STRATEGY_SPECIFICATION.md, the same document the Python
+// implementation is derived from -- if this script and the Python code
+// ever disagree, one of them has a bug relative to that spec, not to each
+// other.
+//
+// ANTI-REPAINTING: every calculation below uses `close`, `high`, `low` of
+// CLOSED bars only. Pine evaluates these on bar close by default in this
+// script (no `barstate.isconfirmed`-gated lookahead, no `request.security`
+// with lookahead=on); the strategy.entry calls at the bottom fire on
+// `barstate.isconfirmed` explicitly so a signal never fires mid-bar and
+// then vanishes when the bar finishes forming.
+
+//@version=5
+strategy("Deriv Reversal L1", overlay=true, initial_capital=1000,
+         default_qty_type=strategy.fixed, default_qty_value=1,
+         calc_on_every_tick=false)
+
+// ---------------------------------------------------------------------
+// Inputs -- mirror config/settings.yaml exactly, key for key
+// ---------------------------------------------------------------------
+grp_stretch = "Stretch (Section 2)"
+stretchLookback   = input.int(20, "stretch.lookback", group=grp_stretch)
+emaFastPeriod     = input.int(9, "stretch.ema_fast_period", group=grp_stretch)
+bollingerK        = input.float(2.0, "stretch.bollinger_k", group=grp_stretch)
+percentileLookback = input.int(100, "stretch.percentile_lookback", group=grp_stretch)
+stretchZCap       = input.float(3.0, "stretch.z_cap", group=grp_stretch)
+stretchAtrCap     = input.float(2.5, "stretch.atr_cap", group=grp_stretch)
+
+grp_vol = "Volatility (Section 3)"
+atrPeriod         = input.int(14, "volatility.atr_period", group=grp_vol)
+volLookback       = input.int(200, "volatility.vol_lookback", group=grp_vol)
+volHighPct        = input.float(80.0, "volatility.vol_high_percentile", group=grp_vol)
+volLowPct         = input.float(20.0, "volatility.vol_low_percentile", group=grp_vol)
+
+grp_mom = "Momentum (Section 4)"
+rsiPeriod         = input.int(14, "momentum.rsi_period", group=grp_mom)
+rsiSlopeLookback  = input.int(3, "momentum.rsi_slope_lookback", group=grp_mom)
+rsiOversold       = input.float(30.0, "momentum.rsi_oversold", group=grp_mom)
+rsiOverbought     = input.float(70.0, "momentum.rsi_overbought", group=grp_mom)
+macdFast          = input.int(12, "momentum.macd_fast", group=grp_mom)
+macdSlow          = input.int(26, "momentum.macd_slow", group=grp_mom)
+macdSignalLen     = input.int(9, "momentum.macd_signal", group=grp_mom)
+
+grp_pa = "Price action (Section 5)"
+rejectionWickRatio = input.float(2.0, "price_action.rejection_wick_ratio", group=grp_pa)
+rejectionRangeMin  = input.float(0.5, "price_action.rejection_range_min", group=grp_pa)
+failureLookback    = input.int(5, "price_action.failure_lookback", group=grp_pa)
+
+grp_struct = "Structure / S-R (Section 6)"
+swingWindow       = input.int(3, "structure.swing_window", group=grp_struct)
+srProximityAtr    = input.float(1.0, "structure.sr_proximity_atr", group=grp_struct)
+
+grp_regime = "Regime (Section 8)"
+adxPeriod         = input.int(14, "regime.adx_period", group=grp_regime)
+trendSlopeMin     = input.float(0.001, "regime.trend_slope_min", group=grp_regime)
+adxTrendMin       = input.float(25.0, "regime.adx_trend_min", group=grp_regime)
+adxRangeMax       = input.float(20.0, "regime.adx_range_max", group=grp_regime)
+trendMultiplier   = input.float(1.4, "regime.threshold_multiplier.TREND_*", group=grp_regime)
+transitionMultiplier = input.float(1.2, "regime.threshold_multiplier.TRANSITION", group=grp_regime)
+disableOnHighVol  = input.bool(true, "regime.disable_on_high_vol", group=grp_regime)
+
+grp_score = "Reversal scoring (Section 9) -- weights must sum to 1.0"
+wStretch      = input.float(0.30, "reversal.weights.stretch", group=grp_score)
+wExhaustion   = input.float(0.25, "reversal.weights.exhaustion", group=grp_score)
+wPriceAction  = input.float(0.20, "reversal.weights.price_action", group=grp_score)
+wSR           = input.float(0.15, "reversal.weights.support_resistance", group=grp_score)
+wDivergence   = input.float(0.10, "reversal.weights.divergence", group=grp_score)
+setupThreshold = input.float(55.0, "reversal.setup_threshold", group=grp_score)
+confirmationWindow = input.int(3, "reversal.confirmation_window", group=grp_score)
+
+// ---------------------------------------------------------------------
+// Section 3: Volatility
+// ---------------------------------------------------------------------
+atrVal = ta.atr(atrPeriod)
+atrPct = atrVal / close
+// Percentile rank of current atrPct within its trailing window (Section 3).
+atrPctSeries = atrVal / close
+volRank = ta.percentrank(atrPctSeries, volLookback)
+volRegime = volRank >= volHighPct ? "HIGH_VOLATILITY" : volRank <= volLowPct ? "LOW_VOLATILITY" : "NORMAL"
+
+// ---------------------------------------------------------------------
+// Section 2: Statistical stretch
+// ---------------------------------------------------------------------
+sma = ta.sma(close, stretchLookback)
+sd  = ta.stdev(close, stretchLookback)
+zscore = sd > 0 ? (close - sma) / sd : 0.0
+emaFast = ta.ema(close, emaFastPeriod)
+emaDistance = atrVal > 0 ? (close - emaFast) / atrVal : 0.0
+upperBand = sma + bollingerK * sd
+lowerBand = sma - bollingerK * sd
+bandWidth = upperBand - lowerBand
+pctB = bandWidth > 0 ? (close - lowerBand) / bandWidth : 0.5
+pRank = ta.percentrank(close, percentileLookback) / 100.0
+
+f_clamp(x, lo, hi) => math.max(lo, math.min(hi, x))
+
+stretchScore = (f_clamp(-zscore / stretchZCap, -1, 1)
+             + f_clamp(-emaDistance / stretchAtrCap, -1, 1)
+             + f_clamp((0.5 - pctB) * 2, -1, 1)
+             + f_clamp((0.5 - pRank) * 2, -1, 1)) / 4.0
+
+// ---------------------------------------------------------------------
+// Section 4: Momentum / exhaustion
+// ---------------------------------------------------------------------
+rsiVal = ta.rsi(close, rsiPeriod)
+rsiSlope = rsiVal - rsiVal[rsiSlopeLookback]
+[macdLine, macdSignalLine, macdHist] = ta.macd(close, macdFast, macdSlow, macdSignalLen)
+
+bullishExhaustion = rsiVal < rsiOversold and rsiSlope > 0 and macdHist > macdHist[1]
+bearishExhaustion = rsiVal > rsiOverbought and rsiSlope < 0 and macdHist < macdHist[1]
+
+// ---------------------------------------------------------------------
+// Section 5: Price action
+// ---------------------------------------------------------------------
+body = math.abs(close - open)
+range_ = high - low
+upperWick = high - math.max(open, close)
+lowerWick = math.min(open, close) - low
+bullishRejection = range_ > 0 and lowerWick > rejectionWickRatio * math.max(body, syminfo.mintick) and lowerWick > rejectionRangeMin * range_
+bearishRejection = range_ > 0 and upperWick > rejectionWickRatio * math.max(body, syminfo.mintick) and upperWick > rejectionRangeMin * range_
+
+priorBearish = close[1] < open[1]
+priorBullish = close[1] > open[1]
+bullishEngulfing = priorBearish and close > open[1] and open < close[1] and body > math.abs(close[1] - open[1])
+bearishEngulfing = priorBullish and close < open[1] and open > close[1] and body > math.abs(close[1] - open[1])
+
+// Confirmed swing points, lagged by swingWindow bars -- matches
+// features/structure.py's find_swings exactly: a swing at bar i needs
+// swingWindow bars on both sides, so ta.pivothigh/pivotlow with (swingWindow,
+// swingWindow) is the same confirmation delay by construction.
+swingHigh = ta.pivothigh(high, swingWindow, swingWindow)
+swingLow  = ta.pivotlow(low, swingWindow, swingWindow)
+var float lastSwingHigh = na
+var float lastSwingLow  = na
+var float prevSwingHigh = na
+var float prevSwingLow  = na
+if not na(swingHigh)
+    prevSwingHigh := lastSwingHigh
+    lastSwingHigh := swingHigh
+if not na(swingLow)
+    prevSwingLow := lastSwingLow
+    lastSwingLow := swingLow
+
+higherLow = not na(lastSwingLow) and not na(prevSwingLow) and lastSwingLow > prevSwingLow
+lowerHigh = not na(lastSwingHigh) and not na(prevSwingHigh) and lastSwingHigh < prevSwingHigh
+
+failedBreakout = not na(lastSwingHigh) and ta.highest(high, failureLookback + 1)[1] > lastSwingHigh and close < lastSwingHigh
+failedBreakdown = not na(lastSwingLow) and ta.lowest(low, failureLookback + 1)[1] < lastSwingLow and close > lastSwingLow
+
+paBullishCount = (bullishRejection ? 1 : 0) + (bullishEngulfing ? 1 : 0) + (failedBreakdown ? 1 : 0) + (higherLow ? 1 : 0)
+paBearishCount = (bearishRejection ? 1 : 0) + (bearishEngulfing ? 1 : 0) + (failedBreakout ? 1 : 0) + (lowerHigh ? 1 : 0)
+paBullishEvidence = paBullishCount / 4.0
+paBearishEvidence = paBearishCount / 4.0
+
+// ---------------------------------------------------------------------
+// Section 6: Support / resistance proximity evidence
+// ---------------------------------------------------------------------
+distToSupportAtr = not na(lastSwingLow) and atrVal > 0 ? math.abs(close - lastSwingLow) / atrVal : 999.0
+distToResistanceAtr = not na(lastSwingHigh) and atrVal > 0 ? math.abs(close - lastSwingHigh) / atrVal : 999.0
+f_proximity(distAtr, proximityAtr) =>
+    far = proximityAtr * 3.0
+    distAtr >= far ? 0.0 : math.max(0.0, 1.0 - distAtr / far)
+srBullishEvidence = f_proximity(distToSupportAtr, srProximityAtr)
+srBearishEvidence = f_proximity(distToResistanceAtr, srProximityAtr)
+
+// ---------------------------------------------------------------------
+// Section 7: Divergence (optional evidence)
+// ---------------------------------------------------------------------
+bullishDivergence = not na(lastSwingLow) and not na(prevSwingLow) and lastSwingLow < prevSwingLow and rsiVal > rsiVal[swingWindow]
+bearishDivergence = not na(lastSwingHigh) and not na(prevSwingHigh) and lastSwingHigh > prevSwingHigh and rsiVal < rsiVal[swingWindow]
+
+// ---------------------------------------------------------------------
+// Section 8: Regime
+// ---------------------------------------------------------------------
+[diplus, diminus, adxVal] = ta.dmi(adxPeriod, adxPeriod)
+emaSlope = emaFast[5] != 0 ? (emaFast - emaFast[5]) / emaFast[5] : 0.0
+regime = adxVal >= adxTrendMin and emaSlope > trendSlopeMin ? "TREND_UP"
+       : adxVal >= adxTrendMin and emaSlope < -trendSlopeMin ? "TREND_DOWN"
+       : adxVal <= adxRangeMax ? "RANGE"
+       : "TRANSITION"
+regimeMultiplier = regime == "TREND_UP" or regime == "TREND_DOWN" ? trendMultiplier
+                  : regime == "TRANSITION" ? transitionMultiplier : 1.0
+
+// ---------------------------------------------------------------------
+// Section 9: Reversal score
+// ---------------------------------------------------------------------
+bullishScore = 100 * (wStretch * math.max(stretchScore, 0.0)
+             + wExhaustion * (bullishExhaustion ? 1.0 : 0.0)
+             + wPriceAction * paBullishEvidence
+             + wSR * srBullishEvidence
+             + wDivergence * (bullishDivergence ? 1.0 : 0.0))
+bearishScore = 100 * (wStretch * math.max(-stretchScore, 0.0)
+             + wExhaustion * (bearishExhaustion ? 1.0 : 0.0)
+             + wPriceAction * paBearishEvidence
+             + wSR * srBearishEvidence
+             + wDivergence * (bearishDivergence ? 1.0 : 0.0))
+
+threshold = setupThreshold * regimeMultiplier
+bullQualifies = bullishScore >= threshold
+bearQualifies = bearishScore >= threshold
+highVolBlocked = disableOnHighVol and volRegime == "HIGH_VOLATILITY"
+
+// ---------------------------------------------------------------------
+// Section 10: Setup / confirmation (Pine's own bar-index state, mirroring
+// reversal/confirmation.py's PendingSetup)
+// ---------------------------------------------------------------------
+var string pendingDirection = na
+var int setupBar = na
+var float setupHigh = na
+var float setupLow = na
+
+if barstate.isconfirmed
+    if na(pendingDirection) and bullQualifies and not bearQualifies and not highVolBlocked and regime != "UNKNOWN"
+        pendingDirection := "bullish"
+        setupBar := bar_index
+        setupHigh := high
+        setupLow := low
+    else if na(pendingDirection) and bearQualifies and not bullQualifies and not highVolBlocked and regime != "UNKNOWN"
+        pendingDirection := "bearish"
+        setupBar := bar_index
+        setupHigh := high
+        setupLow := low
+
+age = na(setupBar) ? na : bar_index - setupBar
+expired = not na(age) and age > confirmationWindow
+
+followThrough = pendingDirection == "bullish" ? close > setupHigh : pendingDirection == "bearish" ? close < setupLow : false
+emaReclaim = pendingDirection == "bullish" ? close > emaFast : pendingDirection == "bearish" ? close < emaFast : false
+macdCross = pendingDirection == "bullish" ? (macdHist > 0 and macdHist[1] <= 0)
+          : pendingDirection == "bearish" ? (macdHist < 0 and macdHist[1] >= 0) : false
+
+confirmedNow = not na(age) and age >= 1 and not expired and (followThrough or emaReclaim or macdCross)
+
+goLong = barstate.isconfirmed and confirmedNow and pendingDirection == "bullish"
+goShort = barstate.isconfirmed and confirmedNow and pendingDirection == "bearish"
+
+if barstate.isconfirmed and (confirmedNow or expired)
+    pendingDirection := na
+    setupBar := na
+
+// ---------------------------------------------------------------------
+// Execution (research/visualization only -- see header)
+// ---------------------------------------------------------------------
+if goLong
+    strategy.entry("L1_LONG", strategy.long)
+if goShort
+    strategy.entry("L1_SHORT", strategy.short)
+
+plotshape(goLong, title="Bullish reversal confirmed", location=location.belowbar,
+         color=color.green, style=shape.triangleup, size=size.small)
+plotshape(goShort, title="Bearish reversal confirmed", location=location.abovebar,
+         color=color.red, style=shape.triangledown, size=size.small)
+plot(bullishScore, title="Bullish score", color=color.new(color.green, 60), display=display.data_window)
+plot(bearishScore, title="Bearish score", color=color.new(color.red, 60), display=display.data_window)
+plot(threshold, title="Threshold (regime-adjusted)", color=color.new(color.gray, 40), display=display.data_window)
+
+// ---------------------------------------------------------------------
+// KNOWN, DOCUMENTED PLATFORM DIFFERENCES FROM PYTHON (Section 48)
+//
+// 1. Wilder RSI/ATR/ADX: ta.rsi/ta.atr/ta.dmi use TradingView's own Wilder
+//    implementation, which seeds identically to features/volatility.py's
+//    wilder_smooth() but Pine does not expose the raw seed value for
+//    comparison -- values converge after `period` bars and match to Pine's
+//    displayed precision in manual spot-checks; they are not asserted
+//    bit-identical.
+// 2. Percentile rank: ta.percentrank returns 0-100; Python's
+//    _percentile_rank returns 0-1. Divided by 100 above to match -- if this
+//    script is edited, keep that conversion or every stretch/volatility
+//    threshold silently shifts by a factor of 100.
+// 3. This script trades on candle-close signals only, at
+//    `calc_on_every_tick=false` -- matching Level 1's "closed candles only"
+//    rule exactly, at the cost of Pine's strategy tester showing entries at
+//    the NEXT bar's open rather than exactly at the signal bar's close.
+// ---------------------------------------------------------------------

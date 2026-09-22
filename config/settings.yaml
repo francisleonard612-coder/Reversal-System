@@ -1,0 +1,141 @@
+# Level 1 configuration. Every parameter named in docs/STRATEGY_SPECIFICATION.md
+# lives here under the matching key -- nothing below is duplicated as a
+# hard-coded literal in source. Env vars (see .env.example) override these
+# at the leaves that operators actually need to touch per-deploy.
+
+mode: research   # research | demo | live -- see .env.example for the two-switch live guard
+
+symbols:
+  - R_100
+  - R_75
+  - R_50
+  - R_25
+  - R_10
+
+contract:
+  type: rise_fall        # this build supports Rise/Fall (CALL/PUT) only
+  duration: 5
+  duration_unit: t        # ticks; the ACTUAL contract settles on tick count
+  # Candle-close approximation used by the backtest AND the reconciliation
+  # job (data/database.py's reconcile_rejected_signals) to evaluate
+  # historical/rejected signals: "won" = direction correct after this many
+  # CLOSED CANDLES, not the real tick-count settlement above. Coarser than
+  # live by design -- see backtest/simulator.py's module docstring -- and
+  # kept as one named number so the backtest and the reconciliation job
+  # can't silently disagree on what "settled" means.
+  duration_bars_approx: 5
+
+candles:
+  timeframe_seconds: 60
+  # Nothing in the feature set needs more history than the largest lookback
+  # it's built from (vol_lookback=200 is the biggest). Capping the window
+  # handed to the feature engine each bar keeps evaluation O(1) per bar
+  # instead of O(n) -- recomputing swings and percentiles over the ENTIRE
+  # history on every closed candle made a backtest quadratic in candle
+  # count (a 5,000-candle run took over a minute). Kept comfortably above
+  # the largest lookback rather than exactly matching it.
+  max_lookback_bars: 400
+
+stretch:
+  lookback: 20
+  ema_fast_period: 9
+  bollinger_k: 2.0
+  percentile_lookback: 100
+  z_cap: 3.0
+  atr_cap: 2.5
+
+volatility:
+  atr_period: 14
+  vol_lookback: 200
+  vol_high_percentile: 80
+  vol_low_percentile: 20
+
+momentum:
+  rsi_period: 14
+  rsi_slope_lookback: 3
+  rsi_oversold: 30
+  rsi_overbought: 70
+  macd_fast: 12
+  macd_slow: 26
+  macd_signal: 9
+  roc_period: 10
+  ema_slope_lookback: 5
+
+price_action:
+  rejection_wick_ratio: 2.0
+  rejection_range_min: 0.5
+  failure_lookback: 5
+
+structure:
+  swing_window: 3
+  zone_merge_pct: 0.0015
+  zone_decay_half_life: 100
+  reclaim_lookback: 5
+  sr_proximity_atr: 1.0
+  sr_min_strength: 2.0
+
+regime:
+  adx_period: 14
+  trend_slope_min: 0.001
+  adx_trend_min: 25
+  adx_range_max: 20
+  min_bars: 50
+  threshold_multiplier:
+    TREND_UP: 1.4
+    TREND_DOWN: 1.4
+    RANGE: 1.0
+    TRANSITION: 1.2
+    # UNKNOWN has no multiplier -- it's a hard gate, not a soft one.
+  disable_on_high_vol: true
+
+reversal:
+  # Must sum to 1.0 -- validated at startup, not silently renormalized.
+  weights:
+    stretch: 0.30
+    exhaustion: 0.25
+    price_action: 0.20
+    support_resistance: 0.15
+    divergence: 0.10
+  setup_threshold: 55.0
+  confirmation_window: 3
+
+edge:
+  # Level 1 has no calibrated probability (that's Level 2's job -- see
+  # strategy/edge_engine.py), so this is a payout-quality floor, not a
+  # computed expected value. A contract quoted below this multiple is
+  # refused regardless of how strong the reversal signal is.
+  min_payout_multiple: 1.80
+
+risk:
+  base_stake: 1.0
+  max_stake: 5.0
+  max_daily_loss: 25.0
+  max_drawdown: 50.0
+  max_consecutive_losses: 8
+  max_trades_per_day: 100
+  max_concurrent_trades: 1
+  cooldown_seconds: 0.0
+  stale_tick_seconds: 30.0
+  max_proposal_age_seconds: 5.0
+
+staking:
+  method: fixed   # fixed | percentage | kelly | martingale
+  # Section 37: martingale OFF by default for this system, without
+  # exception -- "do not attempt to recover losses automatically by
+  # increasing stake" is stated as a default, and this build honors that
+  # default even though the sibling Even/Odd bot runs martingale on.
+  martingale_enabled: false
+  martingale_trigger_losses: 2
+  martingale_factor: 2.0
+  martingale_max_steps: 3
+  kelly_fraction: 0.25
+
+storage:
+  path: data/reversal.db
+
+logging:
+  level: INFO
+
+backtest:
+  n_blocks: 5
+  warmup_bars: 210
