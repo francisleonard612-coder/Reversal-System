@@ -14,6 +14,7 @@ ever read a volume field as if it were real.
 """
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 
 
@@ -90,6 +91,55 @@ class CandleBuilder:
 
         return newly_closed
 
+    def seed_closed(self, candles: list[Candle]) -> int:
+        """Prime this builder with already-CLOSED candles (typically from
+        candles_from_history() below), instead of rebuilding them
+        tick-by-tick from raw history. Must be called before this builder
+        has seen any tick -- seeding a builder mid-stream risks silently
+        reordering or duplicating bars, so that case is rejected outright
+        rather than guessed at.
+
+        Every candle is validated (closed, correct symbol, correct
+        timeframe, strictly increasing) before anything is accepted --
+        a malformed seed would silently corrupt every feature computed
+        downstream from `.closed`, and that is a far worse failure mode
+        than raising here. Returns the number of candles actually seeded.
+        """
+        if self._current is not None or self.closed:
+            raise ValueError(
+                f"{self.symbol}: seed_closed must be called before any "
+                f"tick is added to this builder")
+        if not candles:
+            return 0
+        prev: Candle | None = None
+        for i, c in enumerate(candles):
+            if not c.is_closed:
+                raise ValueError(
+                    f"{self.symbol}: seed_closed candle at index {i} is "
+                    f"not marked closed")
+            if c.symbol != self.symbol:
+                raise ValueError(
+                    f"{self.symbol}: seed_closed candle at index {i} has "
+                    f"symbol {c.symbol!r}, expected {self.symbol!r}")
+            if c.timeframe_seconds != self.timeframe_seconds:
+                raise ValueError(
+                    f"{self.symbol}: seed_closed candle at index {i} has "
+                    f"timeframe_seconds={c.timeframe_seconds}, expected "
+                    f"{self.timeframe_seconds}")
+            if prev is not None and c.open_epoch <= prev.open_epoch:
+                raise ValueError(
+                    f"{self.symbol}: seed_closed candles are not "
+                    f"strictly increasing in open_epoch at index {i}")
+            prev = c
+        self.closed = list(candles)
+        # Guards subsequent add_tick() calls: any live tick this builder
+        # sees is guaranteed to arrive at or after "now" at seed time,
+        # which is strictly after every seeded candle's close_epoch (see
+        # candles_from_history's still-forming filter) -- so this can
+        # never falsely reject a genuine live tick as out-of-order.
+        self._last_epoch = float(candles[-1].close_epoch)
+        return len(self.closed)
+
     def history(self, n: int | None = None) -> list[Candle]:
         """CLOSED candles only -- the forming candle is never returned, so a
         caller cannot accidentally read a bar that hasn't finished yet."""
@@ -100,6 +150,42 @@ class CandleBuilder:
         """Exposed ONLY for monitoring/dashboards. No feature or decision
         code may call this -- see the module docstring."""
         return self._current
+
+
+def candles_from_history(symbol: str, historical: list, timeframe_seconds: int = 60,
+                         now: float | None = None) -> list[Candle]:
+    """Convert deriv.client.HistoricalCandle rows (server-aggregated OHLC,
+    ascending epoch order expected) into CLOSED Candle objects suitable
+    for CandleBuilder.seed_closed().
+
+    The most recent row is dropped unless a FULL timeframe period has
+    elapsed since its open epoch -- Deriv's history endpoint can include
+    the still-forming current candle, and treating that as closed would
+    let a feature computation see a bar before it actually finished (the
+    exact repainting bug the rest of this module exists to prevent).
+    Rows that are out of order or duplicate an epoch already seen are
+    dropped rather than raising, since a defensive re-check here should
+    never crash a cold start over a single bad upstream row -- the
+    caller's own seed_closed() still validates strictly before accepting
+    anything.
+    """
+    now = time.time() if now is None else now
+    out: list[Candle] = []
+    prev_epoch: int | None = None
+    for hc in historical:
+        if hc.epoch + timeframe_seconds > now:
+            continue   # still forming -- never treat as closed
+        if prev_epoch is not None and hc.epoch <= prev_epoch:
+            continue   # defensive: non-increasing/duplicate row
+        out.append(Candle(
+            symbol=symbol, open_epoch=hc.epoch,
+            close_epoch=hc.epoch + timeframe_seconds - 1,
+            open=hc.open, high=hc.high, low=hc.low, close=hc.close,
+            n_ticks=0,   # server-aggregated -- real per-candle tick count is unknown
+            is_closed=True, has_volume=False,
+            timeframe_seconds=timeframe_seconds))
+        prev_epoch = hc.epoch
+    return out
 
 
 def candles_from_ticks(symbol: str, epochs: list[float], prices: list[float],
