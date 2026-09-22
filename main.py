@@ -17,7 +17,7 @@ import sys
 import time
 
 from config.loader import ConfigError, Settings
-from data.candles import CandleBuilder, candles_from_history
+from data.candles import CandleBuilder
 from data.postgres import open_database
 from data.validation import TickValidator
 from deriv.client import DerivAPIError, DerivAuthError, DerivClient
@@ -94,40 +94,23 @@ async def run_live(settings: Settings) -> None:
     open_contracts: set[str] = set()
 
     queues = {}
-    timeframe = settings["candles"]["timeframe_seconds"]
-    # Fetch enough candles to fill the same window features/engine.py's
-    # build_features() ever looks at (max_lookback_bars) -- seeding more
-    # than that is wasted bandwidth, seeding less just delays warm-up.
-    seed_count = settings["candles"].get("max_lookback_bars", 400)
     for sym in usable:
-        try:
-            raw_hist = await client.candle_history(
-                sym, count=seed_count, granularity=timeframe)
-            seed_candles = candles_from_history(sym, raw_hist, timeframe)
-            n = builders[sym].seed_closed(seed_candles)
-            logger.info("%s: seeded %d closed candles from server-"
-                       "aggregated history", sym, n)
-        except Exception:
-            # A cold-start hiccup on one symbol (bad response shape, a
-            # transient Deriv API error, a validation failure in
-            # seed_closed) must never take down the whole live loop --
-            # fall back to the old raw-tick seed instead. Slower warm-up
-            # beats a crash.
-            logger.warning("%s: candle-history seed failed, falling back "
-                          "to raw-tick seed", sym, exc_info=True)
-            try:
-                history = await client.tick_history(sym, count=5000)
-                for t in history:
-                    v = validators[sym].validate(t.epoch, t.price)
-                    if v.valid:
-                        builders[sym].add_tick(t.epoch, t.price)
-                logger.info("%s: seeded %d closed candles from raw-tick "
-                           "fallback", sym, len(builders[sym].closed))
-            except Exception:
-                logger.warning("%s: raw-tick fallback also failed -- "
-                              "starting with zero seeded candles", sym,
-                              exc_info=True)
+        history = await client.tick_history(sym, count=5000)
+        for t in history:
+            v = validators[sym].validate(t.epoch, t.price)
+            if v.valid:
+                newly_closed = builders[sym].add_tick(t.epoch, t.price)
+                # Persisted the same way live candles are, and via the same
+                # INSERT OR IGNORE / ON CONFLICT DO NOTHING path -- every
+                # restart re-seeds from the last 5000 ticks, which overlaps
+                # candles a prior run already saved, and this is what makes
+                # that a no-op instead of a duplicate row (see
+                # data/database.py's v3 migration for why that matters).
+                if newly_closed is not None:
+                    db.record_candle(newly_closed)
         queues[sym] = await client.subscribe_ticks(sym)
+        logger.info("%s: seeded %d closed candles from history (persisted)", sym,
+                   len(builders[sym].closed))
 
     logger.info("entering live loop (mode=%s)", settings.mode)
 
@@ -171,6 +154,14 @@ async def run_live(settings: Settings) -> None:
                 stake=staking.stake_for()[0],
                 min_payout_multiple=settings["edge"]["min_payout_multiple"],
                 risk_manager=risk, research_mode=(settings.mode == "research"))
+
+            # execute_trade() can downgrade the signal-level decision
+            # (economics, risk, research mode, a bad proposal) AFTER the row
+            # above was already written with the pre-downgrade TRADE_* value.
+            # Correct it here so `signals` never claims a trade happened
+            # when execute_trade refused it -- see update_signal_outcome's
+            # docstring in data/database.py.
+            db.update_signal_outcome(signal_id, decision)
 
             if buy_resp is not None:
                 contract_id = buy_resp["contract_id"]
