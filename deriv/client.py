@@ -147,6 +147,18 @@ class BuyAmbiguousError(DerivAPIError):
     against the portfolio, never retried (rule 4)."""
 
 
+class HistoricalCandle:
+    """One raw OHLC row from Deriv's ticks_history(style="candles").
+    Deliberately NOT the same type as data.candles.Candle -- this module
+    "knows nothing about candles" (see module docstring); closedness,
+    ordering guarantees and Candle construction are data/candles.py's
+    job, not this client's."""
+    __slots__ = ("epoch", "open", "high", "low", "close")
+
+    def __init__(self, epoch: int, open: float, high: float, low: float, close: float):
+        self.epoch, self.open, self.high, self.low, self.close = epoch, open, high, low, close
+
+
 @dataclass
 class TickMessage:
     symbol: str
@@ -683,6 +695,54 @@ class DerivClient:
         pip = self._pip_sizes.get(symbol, 2)
         return [TickMessage(symbol, float(t), float(p), pip)
                 for p, t in zip(prices, times)]
+
+    async def candle_history(self, symbol: str, count: int = 400,
+                             granularity: int = 60) -> list[HistoricalCandle]:
+        """Server-aggregated OHLC history for cold start (Section 48),
+        via ticks_history(style="candles") instead of style="ticks".
+
+        tick_history() above returns whole-SECOND epochs, and these
+        synthetic indices emit multiple price updates within the same
+        second -- data/validation.py's TickValidator correctly rejects
+        same-epoch ticks as duplicates (it has no way to know they are
+        genuinely distinct updates), so seeding from raw ticks silently
+        discards most of what was fetched and warms up far slower than a
+        naive tick-count estimate suggests. Deriv aggregates candles
+        server-side with no such ambiguity, so this path is both more
+        accurate AND cheaper (one row per bar instead of one row per
+        tick).
+
+        Returns raw, minimally-validated rows in ascending epoch order.
+        Malformed individual rows are logged and skipped rather than
+        raising -- a single bad row in a 400-row response must not
+        discard the other 399, or hide a genuine survivable Deriv
+        response as if it were a full failure. Deciding which rows count
+        as CLOSED and building actual Candle objects is data/candles.py's
+        job (candles_from_history), per this module's own boundary rule.
+        """
+        resp = await self._send({
+            "ticks_history": symbol, "style": "candles",
+            "granularity": granularity, "count": min(count, 5000),
+            "end": "latest", "adjust_start_time": 1,
+        })
+        raw = resp.get("candles", [])
+        if not isinstance(raw, list):
+            logger.warning("%s: candle-history response had no usable "
+                           "'candles' list (got %r)", symbol, type(raw).__name__)
+            return []
+        out: list[HistoricalCandle] = []
+        for i, c in enumerate(raw):
+            try:
+                out.append(HistoricalCandle(
+                    epoch=int(c["epoch"]), open=float(c["open"]),
+                    high=float(c["high"]), low=float(c["low"]),
+                    close=float(c["close"])))
+            except (KeyError, TypeError, ValueError) as exc:
+                logger.warning("%s: skipping malformed candle at index %d "
+                               "in history response: %s", symbol, i, exc)
+                continue
+        out.sort(key=lambda hc: hc.epoch)
+        return out
 
     # ---- trading ---------------------------------------------------------
 
