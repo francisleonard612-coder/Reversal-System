@@ -105,21 +105,14 @@ async def run_live(settings: Settings) -> None:
                 sym, count=seed_count, granularity=timeframe)
             seed_candles = candles_from_history(sym, raw_hist, timeframe)
             n = builders[sym].seed_closed(seed_candles)
-            # Persisted the same way live candles are, via the same
-            # ON CONFLICT (symbol, close_epoch) DO NOTHING path -- every
-            # restart re-seeds overlapping history, and this is what makes
-            # that a no-op instead of a duplicate row (see
-            # data/database.py's v3 migration for why that matters).
-            for c in seed_candles:
-                db.record_candle(c)
-            logger.info("%s: seeded %d closed candles from server-"
-                       "aggregated history (persisted)", sym, n)
         except Exception:
             # A cold-start hiccup on one symbol (bad response shape, a
             # transient Deriv API error, a validation failure in
             # seed_closed) must never take down the whole live loop --
             # fall back to the old raw-tick seed instead. Slower warm-up
-            # beats a crash.
+            # beats a crash. This ONLY runs if seed_closed never
+            # succeeded, so the builder is still untouched here -- a
+            # raw-tick reseed is safe to attempt.
             logger.warning("%s: candle-history seed failed, falling back "
                           "to raw-tick seed", sym, exc_info=True)
             try:
@@ -136,6 +129,31 @@ async def run_live(settings: Settings) -> None:
                 logger.warning("%s: raw-tick fallback also failed -- "
                               "starting with zero seeded candles", sym,
                               exc_info=True)
+        else:
+            # seed_closed already succeeded -- the builder now correctly
+            # holds `n` candles in memory. Persisting them to Supabase is
+            # best-effort from here on and MUST NOT fall back to a raw-tick
+            # reseed on failure: this builder's internal clock has already
+            # advanced past every seeded candle's close_epoch, so a
+            # raw-tick reseed here would immediately hit "ticks must
+            # arrive in order" and wipe out the good in-memory seed just
+            # persisted -- a DB hiccup and a bad in-memory seed are two
+            # different failures and must not be handled as if they were
+            # the same one.
+            logger.info("%s: seeded %d closed candles from server-"
+                       "aggregated history", sym, n)
+            try:
+                # Persisted the same way live candles are, via the same
+                # ON CONFLICT (symbol, close_epoch) DO NOTHING path --
+                # every restart re-seeds overlapping history, and this is
+                # what makes that a no-op instead of a duplicate row (see
+                # data/database.py's v3 migration for why that matters).
+                for c in seed_candles:
+                    db.record_candle(c)
+            except Exception:
+                logger.warning("%s: could not persist seeded history -- "
+                              "will still trade from the %d candles held "
+                              "in memory", sym, n, exc_info=True)
         queues[sym] = await client.subscribe_ticks(sym)
 
     logger.info("entering live loop (mode=%s)", settings.mode)
