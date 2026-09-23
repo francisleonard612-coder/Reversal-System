@@ -59,6 +59,28 @@ class PostgresDatabase:
                 f"only {found}/5 expected tables exist -- apply "
                 f"supabase/schema.sql in the Supabase SQL editor first")
 
+        # THE CHECK THAT WOULD HAVE CAUGHT THIS. record_candle() below uses
+        # ON CONFLICT (symbol, close_epoch), which requires a matching
+        # unique index -- one that lives in a schema.sql migration, not in
+        # the original table creation. A deploy that ships this code
+        # without re-running that migration crashes on the very first
+        # candle, mid-loop, every restart, with an opaque psycopg error
+        # that gives no hint what's actually missing. Checked here instead,
+        # at startup, so the failure is immediate and the fix is named.
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                select count(*) from pg_indexes
+                 where schemaname='public' and tablename='candles'
+                   and indexname='idx_candles_unique'""")
+            has_index = cur.fetchone()[0]
+        if not has_index:
+            raise PostgresUnavailable(
+                "candles table is missing the idx_candles_unique index "
+                "that record_candle()'s ON CONFLICT clause requires -- "
+                "re-run the LATEST supabase/schema.sql in the Supabase SQL "
+                "editor (it's idempotent, safe to run again) before "
+                "starting the bot")
+
     def is_healthy(self) -> bool:
         try:
             with self.conn.cursor() as cur:
