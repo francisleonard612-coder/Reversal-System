@@ -301,3 +301,57 @@ def test_full_live_run_smoke(settings, db):
     assert n_signals >= 25 and n_candles >= 420
     assert [h.label for h in trader.symbol_horizons["R_100"]] == \
         ["3t", "5t", "7t", "10t", "1m", "2m", "3m", "5m"]
+
+
+def test_startup_survives_slow_database_and_dropped_subscribe(settings, db):
+    """Regression: seeding persisted candles on the event loop froze it long
+    enough for Deriv to drop the socket, and the failed subscribe then killed
+    the process. Seeding must not block the loop, and a failed subscribe must
+    retry."""
+    import random
+    from deriv.client import DerivAPIError, HistoricalCandle
+
+    settings.symbols = ["R_100"]
+    settings.raw["candles"]["seed_bars"] = 400
+    real_record = db.record_candles
+    db.record_candles = lambda cs: (time.sleep(0.6), real_record(cs))[1]   # slow Supabase
+
+    class Client(FakeClient):
+        fails = 1
+
+        async def candle_history(self, sym, count=400, granularity=60, end="latest"):
+            rnd, p = random.Random(1), 100.0
+            return [HistoricalCandle(1_700_000_000 + i * 60, p, p + .1, p - .1,
+                                     p := p + rnd.gauss(0, .2)) for i in range(count)]
+
+        async def subscribe_ticks(self, sym):
+            if Client.fails:
+                Client.fails -= 1
+                raise DerivAPIError("Disconnected", "socket closed")
+            return asyncio.Queue()
+
+        async def ensure_connected(self):
+            pass
+
+    trader = LiveTrader(settings, Client(), db)
+    trader.symbols = ["R_100"]
+    from data.candles import CandleBuilder
+    from strategy.pipeline import SymbolPipeline
+    trader.builders["R_100"] = CandleBuilder("R_100", 60)
+    trader.pipelines["R_100"] = SymbolPipeline("R_100", settings.raw)
+
+    async def go():
+        stamps = []
+
+        async def heartbeat():
+            while True:
+                stamps.append(time.monotonic())
+                await asyncio.sleep(0.02)
+        hb = asyncio.create_task(heartbeat())
+        await trader.seed_candles()
+        hb.cancel()
+        return max(b - a for a, b in zip(stamps, stamps[1:]))
+    longest_freeze = asyncio.run(go())
+    assert "R_100" in trader.queues                        # subscribe retried and succeeded
+    assert longest_freeze < 0.3                            # never frozen by the 0.6s write
+    assert db.conn.execute("SELECT COUNT(*) FROM candles").fetchone()[0] >= 390
