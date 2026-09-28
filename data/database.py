@@ -260,6 +260,15 @@ class Database:
         self.conn.commit()
         return cur.lastrowid
 
+    def record_candles(self, candles: list) -> None:
+        self.conn.executemany(
+            """INSERT OR IGNORE INTO candles (symbol, timeframe_seconds, open_epoch,
+               close_epoch, open, high, low, close, n_ticks, has_volume)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            [(c.symbol, c.timeframe_seconds, c.open_epoch, c.close_epoch, c.open, c.high,
+              c.low, c.close, c.n_ticks, int(c.has_volume)) for c in candles])
+        self.conn.commit()
+
     def record_signal(self, decision) -> int:
         cur = self.conn.execute(
             """INSERT INTO signals (ts, symbol, decision, reason_code,

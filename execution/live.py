@@ -199,8 +199,7 @@ class LiveTrader:
                 logger.info("%s: setup threshold warmed (%s)", sym,
                             getattr(self.pipelines[sym], "threshold_source", "absolute"))
                 try:
-                    for c in seed:
-                        self.db.record_candle(c)
+                    self.db.record_candles(seed)
                 except Exception:
                     logger.warning("%s: could not persist seeded history", sym, exc_info=True)
             self.queues[sym] = await self.client.subscribe_ticks(sym)

@@ -99,8 +99,7 @@ async def _fetch_history(settings: Settings, days: float) -> None:
         for sym in settings.symbols:
             raw = await client.candle_history_paged(sym, total, granularity=tf)
             candles = candles_from_history(sym, raw, tf)
-            for c in candles:
-                db.record_candle(c)
+            db.record_candles(candles)
             span = ((candles[-1].close_epoch - candles[0].close_epoch) / 86400) if candles else 0
             print(f"{sym}: stored {len(candles)} candles ({span:.1f} days)")
     finally:
