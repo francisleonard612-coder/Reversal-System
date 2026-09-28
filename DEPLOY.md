@@ -41,6 +41,8 @@ sharing a database would mix two decision histories in one set of tables.
 | `DATABASE_URL` | pooled Supabase URI | Service role, port 6543. |
 | `SYMBOLS` | `R_100,R_75,R_50,R_25,R_10` | Comma-separated. Each is a candle builder + full feature pipeline -- more symbols is more compute per tick, not more signal. |
 | `BASE_STAKE` / `MAX_STAKE` | `1.0` / `5.0` | Fixed currency, never a percentage at this layer. |
+| `CONTRACT_DURATION` / `CONTRACT_DURATION_UNIT` | `5` / `m` | Must match the research horizon; see 4b. |
+| `LEVEL2_ENABLED` | `false` | Needs a PROMOTED model file; see 4c. |
 | `MAX_DAILY_LOSS` / `MAX_DRAWDOWN` | `25.0` / `50.0` | Hard risk stops; do not auto-clear. |
 | `STAKING_METHOD` | `fixed` | Section 37: martingale has **no env override** in this repo -- see below. |
 
@@ -97,19 +99,45 @@ question.
 4. **`live`** only with a stake you'd shrug at and risk limits you've
    actually decided on, not the shipped defaults.
 
+## 4b. Upgrading an existing deployment
+
+1. Re-run `supabase/schema.sql` in the SQL editor (idempotent). It adds the
+   `idx_candles_unique` index the bot's startup check has always required
+   but the file never created, and the Level 2 prediction columns.
+2. The default contract is now **5 minutes**, not 5 ticks (see README). If
+   you set `CONTRACT_DURATION`/`CONTRACT_DURATION_UNIT`, they must equal
+   `duration_bars_approx` candles or startup refuses.
+3. Risk limits now persist across restarts. If the bot is holding a
+   consecutive-loss stop you've reviewed, clear it with
+   `python main.py --reset-risk --note "..."` (Railway: run as a one-off
+   command), then restart.
+
+## 4c. Level 2
+
+```bash
+python main.py --fetch-history --days 30   # locally or as a one-off Railway command
+python main.py --evaluate
+python main.py --train                     # writes level2.model_path
+```
+With `DB_BACKEND=postgres`, candles and model_versions land in Supabase, but
+the model file itself is written to `level2.model_path` on local disk -- on
+Railway that disk is wiped on redeploy. Train locally against the Supabase
+`DATABASE_URL` and commit `data/level2_model.json`, or mount a Railway
+volume at `data/`. Then set `LEVEL2_ENABLED=true`. A REJECTED model, a
+missing file, or one trained under different settings is refused and the bot
+runs on Level 1 rules, with the reason in the startup log.
+
+```sql
+select * from v_level2_calibration;   -- predicted vs actual win rate on real trades
+```
+
 ## 5. What this build does not do yet
 
-Level 2 (probability models, calibration, ensemble, true expected-value
-computation) and Level 3 (online learning, drift detection,
-champion/challenger) are not implemented -- `--train`, `--evaluate`,
-`--online-sim`, and `--dashboard` print a clear "not implemented at Level 1"
-message rather than doing something fake. `strategy/edge_engine.py`'s
-`EdgeAssessment.expected_value` is `None` for the same reason: Level 1 has
-no probability to compute a true EV from, and inventing one would violate
-Section 62's ban on fabricated probabilities. The `min_payout_multiple`
-floor is Level 1's honest substitute -- read its module docstring before
-assuming a "poor economics" refusal means the same thing it would on the
-Even/Odd bot.
+Level 3 (online learning, drift detection, champion/challenger) and
+`--online-sim` are not implemented. Level 2 is implemented (see 4c) as a
+single calibrated logistic model rather than an ensemble. Without a promoted
+Level 2 model, `EdgeAssessment.expected_value` stays `None` and the
+`min_payout_multiple` floor is the only economic check.
 
 ## 6. Operating queries
 

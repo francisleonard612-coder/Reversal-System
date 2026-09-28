@@ -1,4 +1,4 @@
-# Deriv Reversal Intelligence System -- Level 1
+# Deriv Reversal Intelligence System -- Level 1 + Level 2
 
 A deterministic reversal-trading engine for Deriv Rise/Fall (CALL/PUT)
 contracts on synthetic indices, built to the attached 69-section
@@ -8,7 +8,74 @@ parity), different feature space (candles and technical indicators, not
 digit statistics), sharing only the connection layer, risk manager, and
 deployment shape.
 
-## What's built: Level 1 only
+## What changed in this revision (read first)
+
+- **Live contract now matches what research measures.** Live traded 5-TICK
+  contracts while the backtest, `--reconcile` and Level 2 labels all measured
+  direction 5 one-minute CANDLES later. Default is now a 5-minute contract,
+  and startup refuses a config where the two disagree (tick contracts are
+  allowed but flagged as unvalidated). **This changes live trades.**
+- **Risk controls that existed but never ran are wired:** `register_open`
+  was never called (so `max_trades_per_day`, `cooldown_seconds` and the
+  concurrency limit never triggered), several `settings.yaml` risk/staking
+  values never reached the code, and `max_proposal_age_seconds` /
+  `stale_tick_seconds` were unused.
+- **Risk limits survive restarts.** Today's P/L, trade count and losing
+  streak are rebuilt from the journal on startup; `--reset-risk` is the
+  explicit operator reset. Unsettled contracts are re-attached after a restart.
+- **No fake losses.** A settlement that didn't arrive within 120s was booked
+  as a LOSS with pnl 0 (and any reconnect mid-trade caused exactly that).
+  Now it polls until Deriv reports the real result; booking is idempotent.
+- **Ambiguous buys reconciled** via `portfolio` instead of forgotten.
+- **Supabase schema fixed:** `idx_candles_unique`, required by the bot's own
+  startup check, was missing from `supabase/schema.sql`, so a Postgres
+  deploy could not start. Re-run the schema file (idempotent).
+- **Level 2 implemented:** `--evaluate`, `--train`, and a live EV gate.
+- **Real-data research:** `--fetch-history` downloads Deriv candles;
+  `--backtest` / `--walk-forward` use them (or `--data-file`), and only fall
+  back to the synthetic walk with a loud warning.
+- Also: stale-feed watchdog, periodic balance refresh, reconcile on a timer,
+  `--dashboard`, `.env.example`. 120 tests (was 97), including the Postgres
+  backend against a real Postgres (`TEST_DATABASE_URL`).
+
+## Recommended workflow
+
+```bash
+python main.py --fetch-history --days 30          # real candles into the DB
+python main.py --walk-forward --symbol R_100 --payout-multiple 1.95
+python main.py --evaluate                          # does a model beat Level 1 out of sample?
+python main.py --train                             # saves PROMOTED or REJECTED
+# research mode for days; then --dashboard / v_level2_calibration before demo, then live
+```
+
+Deriv's volatility indices are generated to behave like random walks. Expect
+`--evaluate` to show little or no out-of-sample edge, and a REJECTED model --
+that result is the system working, not failing. It is far cheaper to learn
+it here than from the account balance.
+
+## Level 2 (implemented)
+
+`models/level2.py`. Logistic regression on the same features the live
+pipeline computes (one shared function, `models.dataset.compute_evidence`),
+Platt-calibrated on the newest 20% of data.
+
+- **Promotion is earned:** on every held-out walk-forward block the model must
+  correlate *positively* with real outcomes above `promotion_corr_floor` AND
+  beat the "always predict the base rate" forecaster on Brier score. Otherwise
+  it is saved as REJECTED and the live bot refuses it.
+- **Live EV gate** (when `level2.enabled` and the model is PROMOTED): EV =
+  P(win) x real quoted payout multiple - 1 must be >= `min_ev`, and by default
+  the model's conservative *lower bound* on P(win) must clear break-even.
+  Every priced setup is written to `predictions`; `v_level2_calibration`
+  compares predicted vs actual win rate on real trades.
+- **Fingerprinted:** changing any feature/horizon setting invalidates a saved
+  model until retrained. Artifacts are plain JSON (no pickle).
+- Kelly staking now has the probability bound it needs.
+
+Level 3 (online learning, drift detection, champion/challenger) and
+`--online-sim` remain unimplemented.
+
+## Original Level 1 notes
 
 The spec defines three levels. This repository implements **Level 1
 completely and correctly** -- deterministic reversal logic, no probability
@@ -152,18 +219,21 @@ bot correctly or incorrectly declined.
 ```bash
 pip install -r requirements.txt
 cp .env.example .env        # fill in DERIV_API_TOKEN at minimum
-pytest tests/ -q             # 86 tests
+pytest tests/ -q             # 120 tests (Postgres ones need TEST_DATABASE_URL)
 
 python main.py --status
-python main.py --backtest --payout-multiple 1.85
-python main.py --walk-forward
-python main.py --diagnostics
-python main.py --reconcile   # fills would_have_won for rejected signals
+python main.py --fetch-history --days 30
+python main.py --backtest --symbol R_100 --payout-multiple 1.95
+python main.py --walk-forward --symbol R_100
+python main.py --evaluate | --train
+python main.py --dashboard
+python main.py --reconcile   # also runs automatically every 5 min while live
+python main.py --reset-risk --note "reviewed losses"
 python main.py               # live loop, mode from TRADING_MODE
 ```
 
-`--train`, `--evaluate`, `--online-sim`, `--dashboard` print a clear
-"not implemented at Level 1" message rather than doing something fake.
+`--online-sim` (Level 3) prints a clear "not implemented" message rather than
+doing something fake. See "Recommended workflow" above for the full CLI.
 
 ## Deployment
 

@@ -130,6 +130,27 @@ class RiskManager:
         elif self.drawdown >= abs(self.max_drawdown):
             self.emergency_stop(f"max drawdown hit ({self.drawdown:.2f})")
 
+    def restore(self, *, daily_pnl: float, trades_today: int,
+                consecutive_losses: int, open_trades: int = 0) -> None:
+        """Rebuild today's counters from the trade journal after a restart.
+
+        Previously every counter lived only in memory, so a Railway restart
+        or redeploy silently wiped the daily-loss total, the trade count and
+        the consecutive-loss streak -- a "hard stop" that any crash undid.
+        Restoring them means a limit hit before a restart is still hit after
+        it; `python main.py --reset-risk` is the explicit operator action
+        that clears the streak and latch (see data/database.py
+        risk_state_since()).
+        """
+        self._roll_day()
+        self.daily_pnl = float(daily_pnl)
+        self.trades_today = int(trades_today)
+        self.consecutive_losses = int(consecutive_losses)
+        self.open_trades = int(open_trades)
+        if self.daily_pnl <= -abs(self.max_daily_loss):
+            self.emergency_stop(f"daily loss limit already hit today ({self.daily_pnl:.2f}) "
+                                f"before restart")
+
     def snapshot(self) -> dict:
         return {
             "balance": self.balance, "peak": self.peak_balance,

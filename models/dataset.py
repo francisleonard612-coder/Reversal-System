@@ -58,6 +58,89 @@ FEATURE_NAMES = [
     "high_volatility", "low_volatility", "n_candles_available",
 ]
 
+#: What a Level 2 model is actually fitted on. Everything in FEATURE_NAMES
+#: except `n_candles_available`: in a training replay it grows monotonically
+#: with time (it is effectively a clock), while live it sits near the seed
+#: window size -- a model that leaned on it would learn "when in history
+#: this bar was" and then see a value at serving time it never trained on.
+MODEL_FEATURE_NAMES = [f for f in FEATURE_NAMES if f != "n_candles_available"]
+
+
+@dataclass(frozen=True)
+class BarEvidence:
+    """Everything computed about one closed bar -- the single shared
+    computation behind both the live pipeline (strategy/pipeline.py) and the
+    training replay below, so a model is served exactly what it trained on."""
+    feat: object
+    regime_snap: object
+    stretch: object
+    exhaustion: object
+    price_action: object
+    sr_bullish: float
+    sr_bearish: float
+    divergence: object
+    score: object
+    regime_multiplier: float
+
+
+def compute_evidence(window: list, cfg: dict, weights: ReversalWeights) -> BarEvidence | None:
+    """None when there isn't enough closed history to compute anything."""
+    feat = build_features(window, cfg)
+    if feat is None or not feat.sufficient_data:
+        return None
+    regime_snap = compute_regime(
+        feat.high, feat.low, feat.close_series,
+        ema_slope_value=feat.momentum.ema_slope,
+        adx_period=cfg["regime"]["adx_period"],
+        trend_slope_min=cfg["regime"]["trend_slope_min"],
+        adx_trend_min=cfg["regime"]["adx_trend_min"],
+        adx_range_max=cfg["regime"]["adx_range_max"],
+        min_bars=cfg["regime"]["min_bars"])
+    stretch = compute_stretch(
+        feat.close_series, atr=feat.volatility.atr,
+        lookback=cfg["stretch"]["lookback"],
+        ema_fast_period=cfg["stretch"]["ema_fast_period"],
+        bollinger_k=cfg["stretch"]["bollinger_k"],
+        percentile_lookback=cfg["stretch"]["percentile_lookback"],
+        z_cap=cfg["stretch"]["z_cap"], atr_cap=cfg["stretch"]["atr_cap"])
+    exhaustion = compute_exhaustion(
+        feat.momentum, rsi_oversold=cfg["momentum"]["rsi_oversold"],
+        rsi_overbought=cfg["momentum"]["rsi_overbought"])
+    pa = compute_price_action(
+        feat.open_series, feat.high, feat.low, feat.close_series,
+        swing_window=cfg["structure"]["swing_window"],
+        rejection_wick_ratio=cfg["price_action"]["rejection_wick_ratio"],
+        rejection_range_min=cfg["price_action"]["rejection_range_min"],
+        failure_lookback=cfg["price_action"]["failure_lookback"])
+    srb = sr_bullish_evidence(
+        feat.structure, proximity_atr=cfg["structure"]["sr_proximity_atr"],
+        min_strength=cfg["structure"]["sr_min_strength"])
+    srs = sr_bearish_evidence(
+        feat.structure, proximity_atr=cfg["structure"]["sr_proximity_atr"],
+        min_strength=cfg["structure"]["sr_min_strength"])
+    div = compute_divergence(
+        feat.high, feat.low, feat.rsi_series, feat.macd_hist_series,
+        swing_window=cfg["structure"]["swing_window"])
+    score = score_reversal(stretch=stretch, exhaustion=exhaustion,
+                           price_action=pa, sr_bullish=srb, sr_bearish=srs,
+                           divergence=div, weights=weights)
+    mult = cfg["regime"]["threshold_multiplier"].get(regime_snap.regime, 1.0)
+    return BarEvidence(feat, regime_snap, stretch, exhaustion, pa, srb, srs, div, score, mult)
+
+
+def features_for(ev: BarEvidence, direction: str, n_available: int) -> dict:
+    """Feature dict for `direction` -- what a model scores for a trade in
+    that direction, live or in training."""
+    if direction == "bullish":
+        pa_evidence = ev.price_action.bullish_count() / 4.0
+        sr_ev, div_val, exh = ev.sr_bullish, ev.divergence.bullish_divergence, ev.exhaustion.bullish_exhaustion
+    else:
+        pa_evidence = ev.price_action.bearish_count() / 4.0
+        sr_ev, div_val, exh = ev.sr_bearish, ev.divergence.bearish_divergence, ev.exhaustion.bearish_exhaustion
+    return _to_feature_dict(direction, ev.feat, ev.stretch, None, exh, pa_evidence, sr_ev,
+                            div_val, ev.regime_snap, ev.regime_multiplier,
+                            ev.feat.volatility.volatility_regime, n_available)
+
 
 @dataclass(frozen=True)
 class TrainingExample:
@@ -132,67 +215,12 @@ def build_training_examples(candles: list[Candle], cfg: dict, *,
     for i in range(len(candles)):
         sub = candles[: i + 1]
         window = sub[-max_lookback:] if len(sub) > max_lookback else sub
-        feat = build_features(window, cfg)
-        if feat is None or not feat.sufficient_data:
+        ev = compute_evidence(window, cfg, weights)
+        if ev is None:
             continue
-
-        regime_snap = compute_regime(
-            feat.high, feat.low, feat.close_series,
-            ema_slope_value=feat.momentum.ema_slope,
-            adx_period=cfg["regime"]["adx_period"],
-            trend_slope_min=cfg["regime"]["trend_slope_min"],
-            adx_trend_min=cfg["regime"]["adx_trend_min"],
-            adx_range_max=cfg["regime"]["adx_range_max"],
-            min_bars=cfg["regime"]["min_bars"])
-        stretch = compute_stretch(
-            feat.close_series, atr=feat.volatility.atr,
-            lookback=cfg["stretch"]["lookback"],
-            ema_fast_period=cfg["stretch"]["ema_fast_period"],
-            bollinger_k=cfg["stretch"]["bollinger_k"],
-            percentile_lookback=cfg["stretch"]["percentile_lookback"],
-            z_cap=cfg["stretch"]["z_cap"], atr_cap=cfg["stretch"]["atr_cap"])
-        exhaustion = compute_exhaustion(
-            feat.momentum, rsi_oversold=cfg["momentum"]["rsi_oversold"],
-            rsi_overbought=cfg["momentum"]["rsi_overbought"])
-        pa = compute_price_action(
-            feat.open_series, feat.high, feat.low, feat.close_series,
-            swing_window=cfg["structure"]["swing_window"],
-            rejection_wick_ratio=cfg["price_action"]["rejection_wick_ratio"],
-            rejection_range_min=cfg["price_action"]["rejection_range_min"],
-            failure_lookback=cfg["price_action"]["failure_lookback"])
-        srb = sr_bullish_evidence(
-            feat.structure, proximity_atr=cfg["structure"]["sr_proximity_atr"],
-            min_strength=cfg["structure"]["sr_min_strength"])
-        srs = sr_bearish_evidence(
-            feat.structure, proximity_atr=cfg["structure"]["sr_proximity_atr"],
-            min_strength=cfg["structure"]["sr_min_strength"])
-        div = compute_divergence(
-            feat.high, feat.low, feat.rsi_series, feat.macd_hist_series,
-            swing_window=cfg["structure"]["swing_window"])
-        score = score_reversal(stretch=stretch, exhaustion=exhaustion,
-                               price_action=pa, sr_bullish=srb, sr_bearish=srs,
-                               divergence=div, weights=weights)
-        mult = cfg["regime"]["threshold_multiplier"].get(regime_snap.regime, 1.0)
-
-        if score.bullish >= score.bearish:
-            direction = "bullish"
-            pa_evidence = pa.bullish_count() / 4.0
-            sr_evidence = srb
-            divergence_val = div.bullish_divergence
-            exhaustion_val = exhaustion.bullish_exhaustion
-            blended = score.bullish
-        else:
-            direction = "bearish"
-            pa_evidence = pa.bearish_count() / 4.0
-            sr_evidence = srs
-            divergence_val = div.bearish_divergence
-            exhaustion_val = exhaustion.bearish_exhaustion
-            blended = score.bearish
-
-        features = _to_feature_dict(
-            direction, feat, stretch, None, exhaustion_val, pa_evidence,
-            sr_evidence, divergence_val, regime_snap, mult,
-            feat.volatility.volatility_regime, len(sub))
+        direction = "bullish" if ev.score.bullish >= ev.score.bearish else "bearish"
+        blended = ev.score.bullish if direction == "bullish" else ev.score.bearish
+        features = features_for(ev, direction, len(sub))
 
         settle_idx = i + duration_bars
         label = None

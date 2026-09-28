@@ -99,6 +99,35 @@ class Settings:
         self.db_backend = _env_str("DB_BACKEND", "sqlite")
         self.database_url = _env_str("DATABASE_URL", "")
 
+        c = self.raw.setdefault("contract", {})
+        c["duration"] = _env_int("CONTRACT_DURATION", c.get("duration", 5))
+        c["duration_unit"] = _env_str("CONTRACT_DURATION_UNIT", c.get("duration_unit", "m"))
+        c.setdefault("duration_bars_approx", 5)
+
+        r.setdefault("max_trades_per_day", 100)
+        r.setdefault("max_concurrent_trades", 1)
+        r.setdefault("cooldown_seconds", 0.0)
+        r.setdefault("stale_tick_seconds", 30.0)
+        r.setdefault("max_proposal_age_seconds", 5.0)
+        r.setdefault("settlement_grace_seconds", 60.0)
+        r["max_trades_per_day"] = _env_int("MAX_TRADES_PER_DAY", r["max_trades_per_day"])
+        r["cooldown_seconds"] = _env_float("COOLDOWN_SECONDS", r["cooldown_seconds"])
+
+        l2 = self.raw.setdefault("level2", {})
+        l2["enabled"] = _env_bool("LEVEL2_ENABLED", l2.get("enabled", False))
+        l2["model_path"] = _env_str("LEVEL2_MODEL_PATH", l2.get("model_path", "data/level2_model.json"))
+        l2["min_ev"] = _env_float("LEVEL2_MIN_EV", l2.get("min_ev", 0.0))
+        l2.setdefault("require_lower_bound_edge", True)
+        l2.setdefault("n_blocks", 5)
+        l2.setdefault("min_block_size", 200)
+        l2.setdefault("promotion_corr_floor", 0.05)
+        self.level2 = l2
+
+        ops = self.raw.setdefault("operations", {})
+        ops.setdefault("reconcile_interval_seconds", 300)
+        ops.setdefault("balance_refresh_seconds", 300)
+        self.operations = ops
+
         self.log_level = _env_str("LOG_LEVEL", self.raw.get("logging", {}).get(
             "level", "INFO"))
 
@@ -116,6 +145,36 @@ class Settings:
                 "this off for a reason; confirm this was deliberate")
         if self.risk["base_stake"] > self.risk["max_stake"]:
             raise ConfigError("risk.base_stake must not exceed risk.max_stake")
+        self.horizon_matches_research = self._check_contract_horizon()
+
+    def contract_seconds(self) -> float | None:
+        """Live contract length in seconds, or None for tick contracts
+        (whose wall-clock length isn't fixed)."""
+        c = self.raw["contract"]
+        unit = str(c["duration_unit"]).lower()
+        mult = {"s": 1, "m": 60, "h": 3600}.get(unit)
+        return None if mult is None else float(c["duration"]) * mult
+
+    def _check_contract_horizon(self) -> bool:
+        c = self.raw["contract"]
+        tf = self.raw["candles"]["timeframe_seconds"]
+        live_s = self.contract_seconds()
+        research_s = c["duration_bars_approx"] * tf
+        if live_s is None:
+            logger.warning(
+                "contract is %s %s but backtests, reconciliation and Level 2 "
+                "labels all measure %d candles (%ds). Nothing in this repo "
+                "validates a tick-length contract -- its results are unmeasured.",
+                c["duration"], c["duration_unit"], c["duration_bars_approx"], research_s)
+            return False
+        if abs(live_s - research_s) > 1e-9:
+            raise ConfigError(
+                f"live contract lasts {live_s:.0f}s ({c['duration']}{c['duration_unit']}) "
+                f"but research measures {research_s}s (contract.duration_bars_approx="
+                f"{c['duration_bars_approx']} x {tf}s candles). They must match, or "
+                f"every backtest/reconcile/Level 2 number describes a different bet "
+                f"than the one being traded.")
+        return True
 
     def __getitem__(self, key: str):
         return self.raw[key]

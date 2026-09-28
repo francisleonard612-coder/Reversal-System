@@ -58,10 +58,14 @@ class EdgeAssessment:
     expected_value: float | None    # None at Level 1 -- see module docstring
     payout_floor_met: bool
     reason: str
+    # Level 2 only (None when no promoted model is active)
+    probability: float | None = None
+    probability_lower: float | None = None
+    ev_ok: bool = True
 
     @property
     def economically_sound(self) -> bool:
-        return self.payout_floor_met
+        return self.payout_floor_met and self.ev_ok
 
 
 def assess_level1_economics(proposal: Proposal, *,
@@ -77,3 +81,37 @@ def assess_level1_economics(proposal: Proposal, *,
              f"model to weigh it against")
     return EdgeAssessment(proposal=proposal, expected_value=None,
                           payout_floor_met=met, reason=reason)
+
+
+def assess_level2_economics(proposal: Proposal, *, probability: float,
+                            probability_lower: float, min_payout_multiple: float = 1.80,
+                            min_ev: float = 0.0,
+                            require_lower_bound_edge: bool = True) -> EdgeAssessment:
+    """Sections 25/26 made real, once a PROMOTED Level 2 model supplies a
+    calibrated P(win): EV per unit staked = p * payout_multiple - 1, priced
+    against the actual proposal's payout. The Level 1 payout floor still
+    applies on top.
+
+    With `require_lower_bound_edge`, the conservative lower bound of P(win)
+    must also exceed break-even (1 / payout_multiple) -- an edge that only
+    exists at the point estimate is within the model's own error bars.
+    """
+    m = proposal.payout_multiple
+    floor_met = m >= min_payout_multiple
+    ev = probability * m - 1.0
+    breakeven = 1.0 / m if m > 0 else 1.0
+    reasons = []
+    if not floor_met:
+        reasons.append(f"payout {m:.3f}x below floor {min_payout_multiple:.3f}x")
+    if ev < min_ev:
+        reasons.append(f"EV {ev:+.4f} below minimum {min_ev:+.4f} (p={probability:.4f})")
+    if require_lower_bound_edge and probability_lower <= breakeven:
+        reasons.append(f"P(win) lower bound {probability_lower:.4f} does not clear "
+                       f"break-even {breakeven:.4f}")
+    ev_ok = ev >= min_ev and (not require_lower_bound_edge or probability_lower > breakeven)
+    reason = ("; ".join(reasons) if reasons else
+              f"p={probability:.4f} (lower {probability_lower:.4f}) vs break-even "
+              f"{breakeven:.4f}, EV {ev:+.4f} at {m:.3f}x")
+    return EdgeAssessment(proposal=proposal, expected_value=ev, payout_floor_met=floor_met,
+                          reason=reason, probability=probability,
+                          probability_lower=probability_lower, ev_ok=ev_ok)

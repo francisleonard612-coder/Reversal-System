@@ -15,7 +15,7 @@ import sqlite3
 import time
 from pathlib import Path
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
@@ -162,6 +162,13 @@ class Database:
         ("would_have_won", "INTEGER"),
     )
 
+    _V4_PREDICTION_COLUMNS = (
+        ("signal_id", "INTEGER"),
+        ("probability_lower", "REAL"),
+        ("payout_multiple", "REAL"),
+        ("expected_value", "REAL"),
+    )
+
     def _migrate(self) -> None:
         self.conn.executescript(SCHEMA)
         existing = {r["name"] for r in
@@ -190,6 +197,13 @@ class Database:
         self.conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_candles_unique "
             "ON candles(symbol, close_epoch)")
+
+        # v3 -> v4: Level 2 predictions are linked to the signal they priced
+        # and carry the economics they were judged on.
+        pred_cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(predictions)")}
+        for col, decl in self._V4_PREDICTION_COLUMNS:
+            if col not in pred_cols:
+                self.conn.execute(f"ALTER TABLE predictions ADD COLUMN {col} {decl}")
 
         row = self.conn.execute("SELECT version FROM schema_version LIMIT 1").fetchone()
         if row is None:
@@ -311,12 +325,121 @@ class Database:
 
     def record_trade_result(self, contract_id: int, *, won: bool, pnl: float,
                             exit_spot: float | None = None,
-                            error: str | None = None) -> None:
-        self.conn.execute(
+                            error: str | None = None) -> bool:
+        """Idempotent: settles a trade at most once. Returns True only for
+        the call that actually settled it, so risk/staking counters are
+        updated exactly once even if settlement is observed twice (stream +
+        poll, or again after a restart)."""
+        cur = self.conn.execute(
             "UPDATE trades SET won=?, pnl=?, exit_spot=?, settled_at=?, error=? "
-            "WHERE contract_id=?",
+            "WHERE contract_id=? AND settled_at IS NULL",
             (int(won), pnl, exit_spot, time.time(), error, contract_id))
         self.conn.commit()
+        return cur.rowcount > 0
+
+    def open_trades(self) -> list[dict]:
+        """Bought but not yet settled -- re-attached to settlement tracking
+        on startup so a restart never orphans a live contract."""
+        rows = self.conn.execute(
+            "SELECT * FROM trades WHERE settled_at IS NULL AND contract_id IS NOT NULL "
+            "ORDER BY ts").fetchall()
+        return [dict(r) for r in rows]
+
+    def known_contract_ids(self) -> set:
+        return {r[0] for r in self.conn.execute(
+            "SELECT contract_id FROM trades WHERE contract_id IS NOT NULL")}
+
+    def record_risk_reset(self, note: str = "") -> None:
+        self.log_event("INFO", "risk_reset", note or "operator reset")
+
+    def risk_state_since(self, day_start: float) -> dict:
+        """Today's realized P/L and trade count, plus the current losing
+        streak counted only since the last operator risk reset."""
+        row = self.conn.execute(
+            "SELECT COALESCE(SUM(pnl),0) pnl FROM trades WHERE settled_at >= ?",
+            (day_start,)).fetchone()
+        n_today = self.conn.execute(
+            "SELECT COUNT(*) FROM trades WHERE ts >= ?", (day_start,)).fetchone()[0]
+        reset = self.conn.execute(
+            "SELECT MAX(ts) FROM system_events WHERE category='risk_reset'").fetchone()[0] or 0.0
+        streak = 0
+        for r in self.conn.execute(
+                "SELECT won FROM trades WHERE settled_at IS NOT NULL AND settled_at > ? "
+                "ORDER BY settled_at DESC LIMIT 200", (reset,)):
+            if r[0]:
+                break
+            streak += 1
+        return {"daily_pnl": float(row["pnl"] or 0.0), "trades_today": int(n_today),
+                "consecutive_losses": streak}
+
+    def candle_symbols(self) -> list[str]:
+        return [r[0] for r in self.conn.execute(
+            "SELECT DISTINCT symbol FROM candles ORDER BY symbol")]
+
+    def load_candles(self, symbol: str, limit: int | None = None) -> list:
+        """Stored closed candles for one symbol, oldest first -- the input for
+        real-data backtests and Level 2 training."""
+        from data.candles import Candle
+        q = ("SELECT * FROM candles WHERE symbol=? ORDER BY close_epoch DESC"
+             + (" LIMIT ?" if limit else ""))
+        args = (symbol, limit) if limit else (symbol,)
+        rows = list(self.conn.execute(q, args))[::-1]
+        return [Candle(symbol=r["symbol"], open_epoch=r["open_epoch"],
+                       close_epoch=r["close_epoch"], open=r["open"], high=r["high"],
+                       low=r["low"], close=r["close"], n_ticks=r["n_ticks"],
+                       is_closed=True, has_volume=bool(r["has_volume"]),
+                       timeframe_seconds=r["timeframe_seconds"]) for r in rows]
+
+    def record_prediction(self, *, signal_id: int | None, symbol: str, model_id: str,
+                          model_version: str, probability: float,
+                          calibrated_probability: float, probability_lower: float,
+                          payout_multiple: float | None, expected_value: float | None) -> None:
+        self.conn.execute(
+            "INSERT INTO predictions (ts, symbol, model_id, probability, "
+            "calibrated_probability, model_version, signal_id, probability_lower, "
+            "payout_multiple, expected_value) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (time.time(), symbol, model_id, probability, calibrated_probability,
+             model_version, signal_id, probability_lower, payout_multiple, expected_value))
+        self.conn.commit()
+
+    def record_model_version(self, *, model_id: str, version: str, period_start: float,
+                             period_end: float, features: list, parameters: dict,
+                             calibration_method: str, promotion_status: str) -> None:
+        self.conn.execute(
+            "INSERT INTO model_versions (model_id, version, created_at, "
+            "training_period_start, training_period_end, features, parameters, "
+            "calibration_method, promotion_status) VALUES (?,?,?,?,?,?,?,?,?)",
+            (model_id, version, time.time(), period_start, period_end,
+             json.dumps(features), json.dumps(parameters), calibration_method,
+             promotion_status))
+        self.conn.commit()
+
+    def dashboard(self, day_start: float) -> dict:
+        """One-call operating summary for `--dashboard`."""
+        c = self.conn
+        cf = c.execute(
+            "SELECT COUNT(*) n, AVG(would_have_won) r FROM rejected_signals "
+            "WHERE outcome_evaluated=1").fetchone()
+        preds = c.execute(
+            "SELECT COUNT(*) n, AVG(calibrated_probability) p FROM predictions").fetchone()
+        last_model = c.execute(
+            "SELECT version, promotion_status, created_at FROM model_versions "
+            "ORDER BY id DESC LIMIT 1").fetchone()
+        return {
+            "trades": self.trade_summary(),
+            "today": self.risk_state_since(day_start),
+            "open_trades": len(self.open_trades()),
+            "signals_by_reason": self.reason_histogram(),
+            "candles_stored": {s: c.execute("SELECT COUNT(*) FROM candles WHERE symbol=?",
+                                            (s,)).fetchone()[0] for s in self.candle_symbols()},
+            "counterfactual": {"evaluated": cf["n"] or 0,
+                               "would_have_won_rate": cf["r"]},
+            "predictions": {"n": preds["n"] or 0, "mean_probability": preds["p"]},
+            "latest_model": dict(last_model) if last_model else None,
+            "recent_errors": [dict(r) for r in c.execute(
+                "SELECT ts, level, category, message FROM system_events "
+                "WHERE level IN ('ERROR','CRITICAL','WARNING') ORDER BY ts DESC LIMIT 10")],
+        }
 
     def log_event(self, level: str, category: str, message: str,
                  detail: dict | None = None) -> None:
