@@ -107,7 +107,8 @@ def _pearson(xs, ys) -> float:
 
 def train_and_evaluate_walk_forward(X: np.ndarray, y: np.ndarray,
                                     epochs: np.ndarray, *, n_blocks: int = 5,
-                                    min_block_size: int = 200
+                                    min_block_size: int = 200,
+                                    feature_names: list[str] | None = None
                                     ) -> WalkForwardModelReport:
     """Section 41's TRAIN -> VALIDATE -> TEST -> DEPLOY -> ROLL FORWARD,
     applied to a real classifier: fit on everything before a block,
@@ -168,7 +169,11 @@ def train_and_evaluate_walk_forward(X: np.ndarray, y: np.ndarray,
         except ValueError:
             reliability = []
 
-        coefficients = dict(zip(FEATURE_NAMES, model.coef_[0].tolist()))
+        names = feature_names or FEATURE_NAMES
+        if len(names) != X.shape[1]:
+            raise ValueError(f"{len(names)} feature names for {X.shape[1]} columns -- "
+                             f"coefficients would be silently mislabeled")
+        coefficients = dict(zip(names, model.coef_[0].tolist()))
         report.blocks.append(BlockResult(
             n_train=len(X_train), n_test=len(X_test), brier=brier, log_loss=ll,
             correlation=corr, reliability=reliability, coefficients=coefficients))
@@ -189,7 +194,10 @@ def top_coefficients(report: WalkForwardModelReport, k: int = 8) -> list[tuple]:
     """
     if not report.blocks:
         return []
-    sums = {name: 0.0 for name in FEATURE_NAMES}
+    sums: dict = {}
+    for b in report.blocks:
+        for name in b.coefficients:
+            sums.setdefault(name, 0.0)
     for b in report.blocks:
         for name, coef in b.coefficients.items():
             sums[name] += coef

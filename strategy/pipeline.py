@@ -15,15 +15,10 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 
-from features.engine import FeatureSnapshot, build_features
-from regime.detector import compute_regime
+from features.engine import FeatureSnapshot
+from models.dataset import BarEvidence, compute_evidence, features_for
 from reversal.confirmation import PendingSetup, check_confirmation
-from reversal.divergence import compute_divergence
-from reversal.exhaustion import compute_exhaustion
-from reversal.price_action import compute_price_action
-from reversal.scoring import ReversalWeights, score_reversal
-from reversal.stretch import compute_stretch
-from reversal.support_resistance import sr_bearish_evidence, sr_bullish_evidence
+from reversal.scoring import ReversalWeights
 from strategy.decision_engine import Decision, evaluate_signal
 
 
@@ -35,7 +30,16 @@ class SymbolPipeline:
         self.weights.validate()
         self._pending_setup: PendingSetup | None = None
         self.last_features: FeatureSnapshot | None = None
+        self.last_evidence: BarEvidence | None = None
         self.last_decision: Decision | None = None
+        self.n_available = 0
+
+    def features_for_direction(self, direction: str) -> dict | None:
+        """Level 2 feature vector for a trade in `direction` on the bar just
+        evaluated; None before enough history exists."""
+        if self.last_evidence is None:
+            return None
+        return features_for(self.last_evidence, direction, self.n_available)
 
     def evaluate_on_close(self, candles: list) -> Decision:
         """`candles` is the full CLOSED-only history for this symbol
@@ -54,10 +58,15 @@ class SymbolPipeline:
         # untouched; only the slice passed downstream is bounded.
         max_lookback = cfg["candles"].get("max_lookback_bars", 400)
         window = candles[-max_lookback:] if len(candles) > max_lookback else candles
-        feat = build_features(window, cfg)
-        self.last_features = feat
+        # One shared computation with the Level 2 training replay
+        # (models/dataset.compute_evidence) -- the features a model is served
+        # live are, by construction, the ones it was trained on.
+        ev = compute_evidence(window, cfg, self.weights)
+        self.last_evidence = ev
+        self.last_features = ev.feat if ev is not None else None
+        self.n_available = len(candles)
 
-        if feat is None or not feat.sufficient_data:
+        if ev is None:
             d = evaluate_signal(
                 symbol=self.symbol, timestamp=now, sufficient_data=False,
                 regime="UNKNOWN", volatility_regime="UNKNOWN",
@@ -69,46 +78,8 @@ class SymbolPipeline:
             self.last_decision = d
             return d
 
-        regime_snap = compute_regime(
-            feat.high, feat.low, feat.close_series,
-            ema_slope_value=feat.momentum.ema_slope,
-            adx_period=cfg["regime"]["adx_period"],
-            trend_slope_min=cfg["regime"]["trend_slope_min"],
-            adx_trend_min=cfg["regime"]["adx_trend_min"],
-            adx_range_max=cfg["regime"]["adx_range_max"],
-            min_bars=cfg["regime"]["min_bars"])
-
-        stretch = compute_stretch(
-            feat.close_series, atr=feat.volatility.atr,
-            lookback=cfg["stretch"]["lookback"],
-            ema_fast_period=cfg["stretch"]["ema_fast_period"],
-            bollinger_k=cfg["stretch"]["bollinger_k"],
-            percentile_lookback=cfg["stretch"]["percentile_lookback"],
-            z_cap=cfg["stretch"]["z_cap"], atr_cap=cfg["stretch"]["atr_cap"])
-        exhaustion = compute_exhaustion(
-            feat.momentum, rsi_oversold=cfg["momentum"]["rsi_oversold"],
-            rsi_overbought=cfg["momentum"]["rsi_overbought"])
-        pa = compute_price_action(
-            feat.open_series, feat.high, feat.low, feat.close_series,
-            swing_window=cfg["structure"]["swing_window"],
-            rejection_wick_ratio=cfg["price_action"]["rejection_wick_ratio"],
-            rejection_range_min=cfg["price_action"]["rejection_range_min"],
-            failure_lookback=cfg["price_action"]["failure_lookback"])
-        srb = sr_bullish_evidence(
-            feat.structure, proximity_atr=cfg["structure"]["sr_proximity_atr"],
-            min_strength=cfg["structure"]["sr_min_strength"])
-        srs = sr_bearish_evidence(
-            feat.structure, proximity_atr=cfg["structure"]["sr_proximity_atr"],
-            min_strength=cfg["structure"]["sr_min_strength"])
-        div = compute_divergence(
-            feat.high, feat.low, feat.rsi_series, feat.macd_hist_series,
-            swing_window=cfg["structure"]["swing_window"])
-
-        score = score_reversal(stretch=stretch, exhaustion=exhaustion,
-                               price_action=pa, sr_bullish=srb, sr_bearish=srs,
-                               divergence=div, weights=self.weights)
-
-        multiplier = cfg["regime"]["threshold_multiplier"].get(regime_snap.regime, 1.0)
+        feat, regime_snap, score = ev.feat, ev.regime_snap, ev.score
+        multiplier = ev.regime_multiplier
         threshold = cfg["reversal"]["setup_threshold"]
         bar_index = feat.candle_index   # always len(window)-1: last position, for array access only
 

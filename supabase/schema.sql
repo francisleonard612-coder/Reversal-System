@@ -26,6 +26,14 @@ create table if not exists candles (
     n_ticks integer not null, has_volume boolean not null default false
 );
 create index if not exists idx_candles_symbol_close on candles(symbol, close_epoch);
+-- Required by record_candle()'s ON CONFLICT (symbol, close_epoch) and checked
+-- by the bot at startup (data/postgres.py). Previously MISSING from this file,
+-- so a Supabase deploy following DEPLOY.md refused to start. Dedup first
+-- (restarts before this fix could have written duplicates), then index --
+-- the other order fails on the very duplicates being fixed. Idempotent.
+delete from candles a using candles b
+ where a.symbol = b.symbol and a.close_epoch = b.close_epoch and a.id > b.id;
+create unique index if not exists idx_candles_unique on candles(symbol, close_epoch);
 
 create table if not exists signals (
     id bigserial primary key,
@@ -122,6 +130,14 @@ create table if not exists parameter_changes (
     old_value text, new_value text, reason text
 );
 
+-- v4: Level 2 predictions are linked to the signal they priced and carry
+-- the economics they were judged on. Idempotent -- safe to re-run.
+alter table predictions add column if not exists signal_id bigint references signals(id);
+alter table predictions add column if not exists probability_lower double precision;
+alter table predictions add column if not exists payout_multiple double precision;
+alter table predictions add column if not exists expected_value double precision;
+create index if not exists idx_predictions_signal on predictions(signal_id);
+
 -- ===========================================================================
 -- Views
 -- ===========================================================================
@@ -156,6 +172,20 @@ order by symbol, n desc;
 -- happened on setups the bot declined? This is the Level 2 training
 -- signal, not just an operator curiosity -- a model trained only on the
 -- tiny fraction that got traded is badly survivorship-biased.
+-- Level 2 honesty check: does the model's predicted P(win) match what
+-- actually happened on trades it approved? Buckets of 5 percentage points.
+create or replace view v_level2_calibration as
+select round((floor(p.calibrated_probability * 20) / 20)::numeric, 2) as predicted_bucket,
+       count(*) trades,
+       round(avg(case when t.won then 1.0 else 0.0 end)::numeric, 4) actual_win_rate,
+       round(avg(p.expected_value)::numeric, 4) mean_predicted_ev,
+       round(sum(t.pnl)::numeric, 2) pnl
+from predictions p
+join trades t on t.signal_id = p.signal_id
+where t.settled_at is not null
+group by 1
+order by 1;
+
 create or replace view v_counterfactual_summary as
 select symbol, reason_code,
        count(*) filter (where outcome_evaluated) n_evaluated,

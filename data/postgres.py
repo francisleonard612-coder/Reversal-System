@@ -169,12 +169,131 @@ class PostgresDatabase:
             return cur.fetchone()[0]
 
     def record_trade_result(self, contract_id, *, won, pnl, exit_spot=None,
-                            error=None) -> None:
+                            error=None) -> bool:
+        """Idempotent -- see data/database.Database.record_trade_result."""
         with self.conn.cursor() as cur:
             cur.execute("""
                 update trades set won=%s, pnl=%s, exit_spot=%s, settled_at=%s, error=%s
-                 where contract_id=%s""",
+                 where contract_id=%s and settled_at is null""",
                 (won, pnl, exit_spot, time.time(), error, contract_id))
+            return cur.rowcount > 0
+
+    def open_trades(self) -> list[dict]:
+        with self.conn.cursor() as cur:
+            cur.execute("""select id, signal_id, ts, symbol, contract_id, contract_type,
+                                  stake, payout, buy_price
+                             from trades where settled_at is null and contract_id is not null
+                            order by ts""")
+            cols = [d.name for d in cur.description]
+            return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+    def known_contract_ids(self) -> set:
+        with self.conn.cursor() as cur:
+            cur.execute("select contract_id from trades where contract_id is not null")
+            return {r[0] for r in cur.fetchall()}
+
+    def record_risk_reset(self, note: str = "") -> None:
+        # written directly (not via log_event, which swallows failures): an
+        # operator reset that silently didn't persist would be worse than none
+        with self.conn.cursor() as cur:
+            cur.execute("""insert into system_events (ts, level, category, message)
+                           values (%s,'INFO','risk_reset',%s)""",
+                        (time.time(), note or "operator reset"))
+
+    def risk_state_since(self, day_start: float) -> dict:
+        with self.conn.cursor() as cur:
+            cur.execute("select coalesce(sum(pnl),0) from trades where settled_at >= %s",
+                        (day_start,))
+            pnl = cur.fetchone()[0]
+            cur.execute("select count(*) from trades where ts >= %s", (day_start,))
+            n_today = cur.fetchone()[0]
+            cur.execute("select coalesce(max(ts),0) from system_events where category='risk_reset'")
+            reset = cur.fetchone()[0]
+            cur.execute("""select won from trades where settled_at is not null and settled_at > %s
+                            order by settled_at desc limit 200""", (reset,))
+            streak = 0
+            for (won,) in cur.fetchall():
+                if won:
+                    break
+                streak += 1
+        return {"daily_pnl": float(pnl or 0.0), "trades_today": int(n_today or 0),
+                "consecutive_losses": streak}
+
+    def candle_symbols(self) -> list[str]:
+        with self.conn.cursor() as cur:
+            cur.execute("select distinct symbol from candles order by symbol")
+            return [r[0] for r in cur.fetchall()]
+
+    def load_candles(self, symbol: str, limit: int | None = None) -> list:
+        from data.candles import Candle
+        q = ("""select symbol, open_epoch, close_epoch, open, high, low, close, n_ticks,
+                        has_volume, timeframe_seconds
+                   from candles where symbol=%s order by close_epoch desc"""
+             + (" limit %s" if limit else ""))
+        with self.conn.cursor() as cur:
+            cur.execute(q, (symbol, limit) if limit else (symbol,))
+            rows = cur.fetchall()[::-1]
+        return [Candle(symbol=r[0], open_epoch=int(r[1]), close_epoch=int(r[2]),
+                       open=float(r[3]), high=float(r[4]), low=float(r[5]),
+                       close=float(r[6]), n_ticks=int(r[7] or 0), is_closed=True,
+                       has_volume=bool(r[8]), timeframe_seconds=int(r[9] or 60))
+                for r in rows]
+
+    def record_prediction(self, *, signal_id, symbol, model_id, model_version,
+                          probability, calibrated_probability, probability_lower,
+                          payout_multiple, expected_value) -> None:
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                insert into predictions (ts, symbol, model_id, probability,
+                    calibrated_probability, model_version, signal_id,
+                    probability_lower, payout_multiple, expected_value)
+                values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                (time.time(), symbol, model_id, probability, calibrated_probability,
+                 model_version, signal_id, probability_lower, payout_multiple,
+                 expected_value))
+
+    def record_model_version(self, *, model_id, version, period_start, period_end,
+                             features, parameters, calibration_method,
+                             promotion_status) -> None:
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                insert into model_versions (model_id, version, training_period_start,
+                    training_period_end, features, parameters, calibration_method,
+                    promotion_status)
+                values (%s,%s,%s,%s,%s,%s,%s,%s)""",
+                (model_id, version, period_start, period_end, json.dumps(features),
+                 json.dumps(parameters), calibration_method, promotion_status))
+
+    def dashboard(self, day_start: float) -> dict:
+        with self.conn.cursor() as cur:
+            cur.execute("""select count(*), avg(case when would_have_won then 1.0 else 0.0 end)
+                             from rejected_signals where outcome_evaluated""")
+            cf_n, cf_rate = cur.fetchone()
+            cur.execute("select count(*), avg(calibrated_probability) from predictions")
+            p_n, p_mean = cur.fetchone()
+            cur.execute("""select version, promotion_status, created_at from model_versions
+                            order by id desc limit 1""")
+            lm = cur.fetchone()
+            cur.execute("select symbol, count(*) from candles group by symbol order by symbol")
+            candles = {r[0]: r[1] for r in cur.fetchall()}
+            cur.execute("""select ts, level, category, message from system_events
+                            where level in ('ERROR','CRITICAL','WARNING')
+                            order by ts desc limit 10""")
+            errors = [dict(zip(("ts", "level", "category", "message"), r)) for r in cur.fetchall()]
+        return {
+            "trades": self.trade_summary(),
+            "today": self.risk_state_since(day_start),
+            "open_trades": len(self.open_trades()),
+            "signals_by_reason": self.reason_histogram(),
+            "candles_stored": candles,
+            "counterfactual": {"evaluated": cf_n or 0,
+                               "would_have_won_rate": float(cf_rate) if cf_rate is not None else None},
+            "predictions": {"n": p_n or 0,
+                            "mean_probability": float(p_mean) if p_mean is not None else None},
+            "latest_model": ({"version": lm[0], "promotion_status": lm[1],
+                              "created_at": str(lm[2])} if lm else None),
+            "recent_errors": errors,
+        }
 
     def record_candle(self, c) -> None:
         # ON CONFLICT (symbol, close_epoch) DO NOTHING -- matches the SQLite

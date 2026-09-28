@@ -697,7 +697,8 @@ class DerivClient:
                 for p, t in zip(prices, times)]
 
     async def candle_history(self, symbol: str, count: int = 400,
-                             granularity: int = 60) -> list[HistoricalCandle]:
+                             granularity: int = 60,
+                             end: int | str = "latest") -> list[HistoricalCandle]:
         """Server-aggregated OHLC history for cold start (Section 48),
         via ticks_history(style="candles") instead of style="ticks".
 
@@ -723,7 +724,7 @@ class DerivClient:
         resp = await self._send({
             "ticks_history": symbol, "style": "candles",
             "granularity": granularity, "count": min(count, 5000),
-            "end": "latest", "adjust_start_time": 1,
+            "end": end, "adjust_start_time": 1,
         })
         raw = resp.get("candles", [])
         if not isinstance(raw, list):
@@ -743,6 +744,24 @@ class DerivClient:
                 continue
         out.sort(key=lambda hc: hc.epoch)
         return out
+
+    async def candle_history_paged(self, symbol: str, total: int,
+                                   granularity: int = 60) -> list[HistoricalCandle]:
+        """Up to `total` candles ending now, fetched backwards 5,000 at a time
+        (Deriv's per-request cap). Used by `--fetch-history` to build a real
+        dataset for backtesting and Level 2 training."""
+        out: dict[int, HistoricalCandle] = {}
+        end: int | str = "latest"
+        while len(out) < total:
+            page = await self.candle_history(symbol, count=min(5000, total - len(out)),
+                                             granularity=granularity, end=end)
+            new = [c for c in page if c.epoch not in out]
+            if not new:
+                break
+            for c in new:
+                out[c.epoch] = c
+            end = min(c.epoch for c in page) - 1
+        return [out[k] for k in sorted(out)]
 
     # ---- trading ---------------------------------------------------------
 

@@ -14,15 +14,19 @@ symbols:
 
 contract:
   type: rise_fall        # this build supports Rise/Fall (CALL/PUT) only
+  # LIVE CONTRACT HORIZON == RESEARCH HORIZON. Previously the live contract
+  # was 5 TICKS (~5-10 seconds) while the backtest, the rejected-signal
+  # reconciliation and the Level 2 labels all measured direction 5 CLOSED
+  # 60s CANDLES later (~5 minutes). Every number those tools produced was
+  # about a different bet than the one actually being placed. The live
+  # contract now settles on the same horizon everything else measures:
+  # duration x duration_unit must equal duration_bars_approx candles --
+  # enforced at startup by config/loader.py. Override per deploy with
+  # CONTRACT_DURATION / CONTRACT_DURATION_UNIT (m or s); a tick-based
+  # contract is still allowed but logs a loud warning because nothing in
+  # this repo can then validate it.
   duration: 5
-  duration_unit: t        # ticks; the ACTUAL contract settles on tick count
-  # Candle-close approximation used by the backtest AND the reconciliation
-  # job (data/database.py's reconcile_rejected_signals) to evaluate
-  # historical/rejected signals: "won" = direction correct after this many
-  # CLOSED CANDLES, not the real tick-count settlement above. Coarser than
-  # live by design -- see backtest/simulator.py's module docstring -- and
-  # kept as one named number so the backtest and the reconciliation job
-  # can't silently disagree on what "settled" means.
+  duration_unit: m
   duration_bars_approx: 5
 
 candles:
@@ -117,6 +121,10 @@ risk:
   cooldown_seconds: 0.0
   stale_tick_seconds: 30.0
   max_proposal_age_seconds: 5.0
+  # extra time allowed past contract expiry for Deriv's settlement message
+  # before the bot switches to polling for the result. An unknown outcome
+  # is NEVER recorded as a loss -- the trade stays open until it settles.
+  settlement_grace_seconds: 60.0
 
 staking:
   method: fixed   # fixed | percentage | kelly | martingale
@@ -129,6 +137,30 @@ staking:
   martingale_factor: 2.0
   martingale_max_steps: 3
   kelly_fraction: 0.25
+
+level2:
+  # Calibrated P(win) model trained by `python main.py --train`. Used live
+  # ONLY when enabled here (or LEVEL2_ENABLED=true) AND the saved model
+  # passed the walk-forward promotion bar -- a model that failed it is
+  # saved for inspection but never trades. When active, a trade also needs
+  # a positive expected value computed from the model probability and the
+  # REAL proposal payout (Sections 25/26), on top of every Level 1 check.
+  enabled: false
+  model_path: data/level2_model.json
+  min_ev: 0.0                  # EV per unit staked: p * payout_multiple - 1
+  # require the LOWER confidence bound of P(win) to clear break-even
+  # (1 / payout_multiple), not just the point estimate
+  require_lower_bound_edge: true
+  n_blocks: 5
+  min_block_size: 200
+  promotion_corr_floor: 0.05
+
+operations:
+  # counterfactual outcomes for rejected signals, reconciled while live
+  # instead of only via a manual `--reconcile` run
+  reconcile_interval_seconds: 300
+  # re-read the real account balance so drawdown/stake checks don't drift
+  balance_refresh_seconds: 300
 
 storage:
   path: data/reversal.db

@@ -138,7 +138,8 @@ def evaluate_signal(*, symbol: str, timestamp: float, sufficient_data: bool,
 
 
 def apply_economics_and_risk(decision: Decision, *, edge_assessment,
-                             risk_decision, research_mode: bool = False) -> Decision:
+                             risk_decision, research_mode: bool = False,
+                             max_proposal_age_seconds: float = 5.0) -> Decision:
     """Second pass, once a real proposal and a real risk check exist.
     Mirrors the Even/Odd engine's two-phase gate for the same reason: the
     signal-level decision (above) is cheap and needs no API call, so it
@@ -162,7 +163,7 @@ def apply_economics_and_risk(decision: Decision, *, edge_assessment,
         return decision
 
     decision.payout_multiple = edge_assessment.proposal.payout_multiple
-    if edge_assessment.proposal.is_stale():
+    if edge_assessment.proposal.is_stale(max_age_seconds=max_proposal_age_seconds):
         decision.decision = "NO_TRADE"
         decision.reason_code = NO_TRADE_STALE_PROPOSAL
         decision.explanation = "proposal too old to execute safely"
