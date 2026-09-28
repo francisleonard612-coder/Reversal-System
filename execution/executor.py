@@ -48,6 +48,9 @@ async def execute_trade(client: DerivClient, db, *, decision: Decision,
                         level2_model=None, level2_features: dict | None = None,
                         level2_min_ev: float = 0.0,
                         level2_require_lower_bound: bool = True,
+                        expiry_options: list | None = None,
+                        expiry_require_edge: bool = True,
+                        proposals_to_price: int = 3,
                         ) -> tuple[Decision, EdgeAssessment | None, dict | None]:
     """Full flow: proposal -> economics/risk check -> buy -> record. Returns
     the (possibly downgraded to NO_TRADE) decision, the edge assessment for
@@ -64,35 +67,69 @@ async def execute_trade(client: DerivClient, db, *, decision: Decision,
     from strategy.decision_engine import apply_economics_and_risk
 
     direction = "bullish" if decision.decision == "TRADE_BULLISH" else "bearish"
+    chosen_duration, chosen_unit = duration, duration_unit
 
-    try:
-        proposal = await get_proposal(
-            client, symbol=symbol, direction=direction, stake=stake,
-            currency=currency, duration=duration, duration_unit=duration_unit)
-    except (DerivAPIError, ExecutionError) as exc:
-        decision.decision = "NO_TRADE"
-        decision.reason_code = "NO_TRADE_BAD_PROPOSAL"
-        decision.explanation = f"proposal request failed: {exc}"
-        return decision, None, None
-
-    if level2_model is not None and level2_features is not None:
-        # A promoted model is active: price the trade with a real P(win)
-        # against the real quoted payout (true EV), not just a payout floor.
-        raw_p, cal_p, lower_p = level2_model.predict(level2_features)
+    if expiry_options:
+        # MC-calibrated expiry (strategy/expiry.py): price the most promising
+        # expiries with REAL quotes and take the best worst-case EV.
+        priced = []
+        for est in expiry_options[:max(1, proposals_to_price)]:
+            h = est.horizon
+            try:
+                prop = await get_proposal(client, symbol=symbol, direction=direction, stake=stake,
+                                          currency=currency, duration=h.value, duration_unit=h.unit)
+            except (DerivAPIError, ExecutionError):
+                continue   # e.g. an expiry Deriv doesn't quote right now
+            priced.append((est.p_lower * prop.payout_multiple - 1.0, est, prop))
+        if not priced:
+            decision.decision = "NO_TRADE"
+            decision.reason_code = "NO_TRADE_BAD_PROPOSAL"
+            decision.explanation = "no calibrated expiry could be priced"
+            return decision, None, None
+        _, est, proposal = max(priced, key=lambda t: t[0])
+        chosen_duration, chosen_unit = est.horizon.value, est.horizon.unit
+        p_mean, p_lower = est.p_mean, est.p_lower
+        model_note = f"{est.horizon.label} {est.wins}/{est.n} {est.population}"
+        # A promoted Level 2 model is trained on the default contract's horizon
+        # only; when the chosen expiry IS that horizon, both must agree (the
+        # more conservative probability is used).
+        if (level2_model is not None and level2_features is not None
+                and (chosen_duration, chosen_unit) == (duration, duration_unit)):
+            _, l2_cal, l2_lower = level2_model.predict(level2_features)
+            p_mean, p_lower = min(p_mean, l2_cal), min(p_lower, l2_lower)
+            model_note += f" + level2 {level2_model.version}"
         edge = assess_level2_economics(
-            proposal, probability=cal_p, probability_lower=lower_p,
+            proposal, probability=p_mean, probability_lower=p_lower,
             min_payout_multiple=min_payout_multiple, min_ev=level2_min_ev,
-            require_lower_bound_edge=level2_require_lower_bound)
-        try:
-            db.record_prediction(
-                signal_id=signal_id, symbol=symbol, model_id=level2_model.model_id,
-                model_version=level2_model.version, probability=raw_p,
-                calibrated_probability=cal_p, probability_lower=lower_p,
-                payout_multiple=proposal.payout_multiple, expected_value=edge.expected_value)
-        except Exception as exc:  # noqa: BLE001 - bookkeeping must not block a decision
-            db.log_event("WARNING", "level2", f"could not record prediction: {exc}")
+            require_lower_bound_edge=expiry_require_edge)
+        edge = type(edge)(**{**edge.__dict__,
+                             "reason": f"expiry {est.horizon.label} (MC, {est.wins}/{est.n} "
+                                       f"{est.population}): {edge.reason}"})
+        _record_prediction(db, signal_id, symbol, "expiry_mc", model_note, p_mean, p_mean,
+                           p_lower, proposal, edge)
     else:
-        edge = assess_level1_economics(proposal, min_payout_multiple=min_payout_multiple)
+        try:
+            proposal = await get_proposal(
+                client, symbol=symbol, direction=direction, stake=stake,
+                currency=currency, duration=duration, duration_unit=duration_unit)
+        except (DerivAPIError, ExecutionError) as exc:
+            decision.decision = "NO_TRADE"
+            decision.reason_code = "NO_TRADE_BAD_PROPOSAL"
+            decision.explanation = f"proposal request failed: {exc}"
+            return decision, None, None
+
+        if level2_model is not None and level2_features is not None:
+            # A promoted model is active: price the trade with a real P(win)
+            # against the real quoted payout (true EV), not just a payout floor.
+            raw_p, cal_p, lower_p = level2_model.predict(level2_features)
+            edge = assess_level2_economics(
+                proposal, probability=cal_p, probability_lower=lower_p,
+                min_payout_multiple=min_payout_multiple, min_ev=level2_min_ev,
+                require_lower_bound_edge=level2_require_lower_bound)
+            _record_prediction(db, signal_id, symbol, level2_model.model_id,
+                               level2_model.version, raw_p, cal_p, lower_p, proposal, edge)
+        else:
+            edge = assess_level1_economics(proposal, min_payout_multiple=min_payout_multiple)
     risk_decision = risk_manager.can_trade(stake)
     decision = apply_economics_and_risk(decision, edge_assessment=edge,
                                         risk_decision=risk_decision,
@@ -148,13 +185,28 @@ async def execute_trade(client: DerivClient, db, *, decision: Decision,
         idempotency_key=idempotency_key, contract_type=proposal.contract_type,
         stake=stake, payout=proposal.payout,
         buy_price=float(buy_resp.get("buy_price", proposal.ask_price)),
-        entry_spot=float(buy_resp.get("start_spot", 0.0) or 0.0))
+        entry_spot=float(buy_resp.get("start_spot", 0.0) or 0.0),
+        duration=chosen_duration, duration_unit=chosen_unit)
+    decision.explanation = (f"{decision.explanation} | expiry {chosen_duration}{chosen_unit}"
+                            if decision.explanation else f"expiry {chosen_duration}{chosen_unit}")
+    buy_resp = {**buy_resp, "_duration": chosen_duration, "_duration_unit": chosen_unit}
     # Previously never called: trades_today, cooldown and the concurrency
     # limit all read counters that nothing ever incremented.
     if hasattr(risk_manager, "register_open"):
         risk_manager.register_open(stake)
 
     return decision, edge, buy_resp
+
+
+def _record_prediction(db, signal_id, symbol, model_id, version, raw_p, cal_p, lower_p,
+                       proposal, edge) -> None:
+    try:
+        db.record_prediction(
+            signal_id=signal_id, symbol=symbol, model_id=model_id, model_version=version,
+            probability=raw_p, calibrated_probability=cal_p, probability_lower=lower_p,
+            payout_multiple=proposal.payout_multiple, expected_value=edge.expected_value)
+    except Exception as exc:  # noqa: BLE001 - bookkeeping must not block a decision
+        db.log_event("WARNING", "prediction", f"could not record prediction: {exc}")
 
 
 async def reconcile_ambiguous_buy(client, db, *, symbol: str, contract_type: str,

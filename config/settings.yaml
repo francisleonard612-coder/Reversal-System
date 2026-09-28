@@ -39,6 +39,9 @@ candles:
   # count (a 5,000-candle run took over a minute). Kept comfortably above
   # the largest lookback rather than exactly matching it.
   max_lookback_bars: 400
+  # candles fetched at startup; the extra history warms the percentile
+  # threshold's score history so setups can qualify from the first bar
+  seed_bars: 1500
 
 stretch:
   lookback: 20
@@ -102,6 +105,28 @@ reversal:
     divergence: 0.10
   setup_threshold: 55.0
   confirmation_window: 3
+  # DATA-CALIBRATED SETUP THRESHOLD. The absolute 55 (x1.4 in trends = 77)
+  # was never calibrated to how the score is actually distributed: on
+  # random-walk-like data (what Deriv volatility indices are built to be)
+  # ranging markets almost never reach 55, and the high readings that do
+  # occur are nearly all counter-trend, where 77 applies -- 12,000 bars
+  # produced ZERO setups in testing. In `percentile` mode a setup is the
+  # strongest readings on the symbol's OWN recent history instead: the
+  # score must be in the top (100 - setup_percentile)% of the last
+  # score_history_bars bars (computed from PRIOR bars only -- no
+  # lookahead), stricter in trends exactly as the regime multiplier was,
+  # and never below min_absolute_score. Whether these setups are GOOD is
+  # measured, not assumed: setup_outcomes + the MC expiry gate.
+  # `absolute` restores the original behavior.
+  threshold_mode: percentile
+  setup_percentile:
+    RANGE: 98.0
+    TRANSITION: 99.0
+    TREND_UP: 99.5
+    TREND_DOWN: 99.5
+  min_absolute_score: 35.0
+  score_history_bars: 1440
+  min_score_history: 300
 
 edge:
   # Level 1 has no calibrated probability (that's Level 2's job -- see
@@ -137,6 +162,25 @@ staking:
   martingale_factor: 2.0
   martingale_max_steps: 3
   kelly_fraction: 0.25
+
+expiry:
+  # Monte Carlo-calibrated expiry per trade -- see strategy/expiry.py.
+  # When on, each confirmed setup is priced at the expiries with the best
+  # conservative P(win) from real recorded outcomes, and bought at whichever
+  # gives the best worst-case EV at the real quoted payout. Until a horizon
+  # has min_samples outcomes the bot uses contract.duration/duration_unit
+  # under Level 1 rules, so trades open while evidence builds.
+  enabled: true
+  horizons: [3t, 5t, 7t, 10t, 1m, 2m, 3m, 5m]
+  min_samples: 200               # simulated: noise passes the gate ~1.3%, a true 56% edge ~50% at 200 / 94% at 800
+  lookback_days: 14              # only recent evidence -- markets drift
+  credible_quantile: 0.05        # before the Bonferroni split across horizons
+  mc_draws: 4000
+  pool_symbols: true             # borrow strength across symbols while a symbol's own sample is small
+  require_edge: true             # worst-case EV (lower-bound P(win) x payout - 1) must be > 0
+  proposals_to_price: 3          # real Deriv quotes requested per setup (rate-limit budget)
+  refresh_seconds: 300           # re-read outcome counts from the DB
+  seconds_per_tick: 2.0          # settlement-wait estimate for tick contracts
 
 level2:
   # Calibrated P(win) model trained by `python main.py --train`. Used live

@@ -112,6 +112,29 @@ question.
    `python main.py --reset-risk --note "..."` (Railway: run as a one-off
    command), then restart.
 
+## 4b-2. Percentile setups and MC expiry (latest revision)
+
+1. Re-run `supabase/schema.sql` again (adds `setup_outcomes`, trade
+   `duration`/`duration_unit`, views `v_expiry_win_rates` and
+   `v_trades_by_expiry`).
+2. Backfill evidence (one-off Railway commands, or locally against the
+   Supabase `DATABASE_URL`):
+   ```bash
+   python main.py --fetch-history --days 14
+   python main.py --calibrate-expiry
+   python main.py --expiry-report
+   ```
+3. `TRADING_MODE=demo` to see trades open. Optionally
+   `EXPIRY_REQUIRE_EDGE=false` in demo only, to keep trading the best
+   calibrated expiry before it has shown an edge.
+4. Watch in Supabase:
+   ```sql
+   select * from v_expiry_win_rates where n >= 50;
+   select * from v_trades_by_expiry;
+   select reason_code, count(*) from signals group by 1 order by 2 desc;
+   ```
+   Break-even win rate is 1 / payout multiple (~0.513 at 1.95x).
+
 ## 4c. Level 2
 
 ```bash

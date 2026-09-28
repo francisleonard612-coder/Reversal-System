@@ -123,6 +123,25 @@ class Settings:
         l2.setdefault("promotion_corr_floor", 0.05)
         self.level2 = l2
 
+        ex = self.raw.setdefault("expiry", {})
+        ex["enabled"] = _env_bool("EXPIRY_CALIBRATION", ex.get("enabled", True))
+        ex["require_edge"] = _env_bool("EXPIRY_REQUIRE_EDGE", ex.get("require_edge", True))
+        ex["min_samples"] = _env_int("EXPIRY_MIN_SAMPLES", ex.get("min_samples", 200))
+        hs = os.getenv("EXPIRY_HORIZONS")
+        if hs:
+            ex["horizons"] = [h.strip() for h in hs.split(",") if h.strip()]
+        ex.setdefault("horizons", ["3t", "5t", "7t", "10t", "1m", "2m", "3m", "5m"])
+        for k, v in (("lookback_days", 14), ("credible_quantile", 0.05), ("mc_draws", 4000),
+                     ("pool_symbols", True), ("proposals_to_price", 3),
+                     ("refresh_seconds", 300), ("seconds_per_tick", 2.0)):
+            ex.setdefault(k, v)
+        from strategy.expiry import parse_horizons
+        try:
+            self.expiry_horizons = parse_horizons(ex["horizons"])
+        except ValueError as exc:
+            raise ConfigError(f"expiry.horizons: {exc}") from exc
+        self.expiry = ex
+
         ops = self.raw.setdefault("operations", {})
         ops.setdefault("reconcile_interval_seconds", 300)
         ops.setdefault("balance_refresh_seconds", 300)

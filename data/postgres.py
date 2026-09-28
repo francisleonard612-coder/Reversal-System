@@ -158,14 +158,16 @@ class PostgresDatabase:
                      decision.reason_code, direction))
 
     def record_trade_open(self, *, signal_id, symbol, contract_id, idempotency_key,
-                          contract_type, stake, payout, buy_price, entry_spot) -> int:
+                          contract_type, stake, payout, buy_price, entry_spot,
+                          duration=None, duration_unit=None) -> int:
         with self.conn.cursor() as cur:
             cur.execute("""
                 insert into trades (signal_id, ts, symbol, contract_id,
-                    idempotency_key, contract_type, stake, payout, buy_price, entry_spot)
-                values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) returning id""",
+                    idempotency_key, contract_type, stake, payout, buy_price, entry_spot,
+                    duration, duration_unit)
+                values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) returning id""",
                 (signal_id, time.time(), symbol, contract_id, idempotency_key,
-                 contract_type, stake, payout, buy_price, entry_spot))
+                 contract_type, stake, payout, buy_price, entry_spot, duration, duration_unit))
             return cur.fetchone()[0]
 
     def record_trade_result(self, contract_id, *, won, pnl, exit_spot=None,
@@ -263,6 +265,29 @@ class PostgresDatabase:
                 values (%s,%s,%s,%s,%s,%s,%s,%s)""",
                 (model_id, version, period_start, period_end, json.dumps(features),
                  json.dumps(parameters), calibration_method, promotion_status))
+
+    def record_setup_outcomes(self, rows: list[dict]) -> int:
+        with self.conn.cursor() as cur:
+            n = 0
+            for r in rows:
+                cur.execute("""
+                    insert into setup_outcomes (ts, symbol, setup_epoch, direction, confirmed,
+                        score, regime, horizon, entry_price, exit_price, won, source)
+                    values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    on conflict (symbol, setup_epoch, direction, horizon) do nothing""",
+                    (time.time(), r["symbol"], r["setup_epoch"], r["direction"],
+                     bool(r["confirmed"]), r.get("score"), r.get("regime"), r["horizon"],
+                     r.get("entry_price"), r.get("exit_price"), bool(r["won"]), r["source"]))
+                n += cur.rowcount
+            return n
+
+    def setup_outcome_counts(self, since_epoch: float = 0) -> list[tuple]:
+        with self.conn.cursor() as cur:
+            cur.execute("""select symbol, direction, horizon, confirmed,
+                                  count(*) filter (where won), count(*)
+                             from setup_outcomes where setup_epoch >= %s
+                            group by symbol, direction, horizon, confirmed""", (since_epoch,))
+            return [tuple(r) for r in cur.fetchall()]
 
     def dashboard(self, day_start: float) -> dict:
         with self.conn.cursor() as cur:
