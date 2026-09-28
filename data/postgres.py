@@ -266,20 +266,22 @@ class PostgresDatabase:
                 (model_id, version, period_start, period_end, json.dumps(features),
                  json.dumps(parameters), calibration_method, promotion_status))
 
-    def record_setup_outcomes(self, rows: list[dict]) -> int:
-        with self.conn.cursor() as cur:
-            n = 0
-            for r in rows:
-                cur.execute("""
-                    insert into setup_outcomes (ts, symbol, setup_epoch, direction, confirmed,
-                        score, regime, horizon, entry_price, exit_price, won, source)
-                    values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                    on conflict (symbol, setup_epoch, direction, horizon) do nothing""",
-                    (time.time(), r["symbol"], r["setup_epoch"], r["direction"],
-                     bool(r["confirmed"]), r.get("score"), r.get("regime"), r["horizon"],
-                     r.get("entry_price"), r.get("exit_price"), bool(r["won"]), r["source"]))
-                n += cur.rowcount
-            return n
+    def record_setup_outcomes(self, rows: list[dict], batch_size: int = 1000) -> int:
+        """Batched (see record_candles). Returns rows actually inserted."""
+        sql = """insert into setup_outcomes (ts, symbol, setup_epoch, direction, confirmed,
+                     score, regime, horizon, entry_price, exit_price, won, source)
+                 values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                 on conflict (symbol, setup_epoch, direction, horizon) do nothing"""
+        now, n = time.time(), 0
+        for i in range(0, len(rows), batch_size):
+            chunk = rows[i:i + batch_size]
+            with self.conn.cursor() as cur:
+                cur.executemany(sql, [(now, r["symbol"], r["setup_epoch"], r["direction"],
+                                       bool(r["confirmed"]), r.get("score"), r.get("regime"),
+                                       r["horizon"], r.get("entry_price"), r.get("exit_price"),
+                                       bool(r["won"]), r["source"]) for r in chunk])
+                n += max(cur.rowcount, 0)
+        return n
 
     def setup_outcome_counts(self, since_epoch: float = 0) -> list[tuple]:
         with self.conn.cursor() as cur:
@@ -335,6 +337,22 @@ class PostgresDatabase:
                 on conflict (symbol, close_epoch) do nothing""",
                 (c.symbol, c.timeframe_seconds, c.open_epoch, c.close_epoch,
                  c.open, c.high, c.low, c.close, c.n_ticks, c.has_volume))
+
+    def record_candles(self, candles: list, batch_size: int = 1000) -> None:
+        """Bulk version of record_candle: one pipelined batch per 1,000 rows
+        instead of one network round trip per candle. Over a high-latency
+        link (e.g. ~200ms to the Supabase region) the per-row version took
+        hours for a 14-day backfill; this takes seconds."""
+        sql = """insert into candles (symbol, timeframe_seconds, open_epoch,
+                    close_epoch, open, high, low, close, n_ticks, has_volume)
+                 values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                 on conflict (symbol, close_epoch) do nothing"""
+        for i in range(0, len(candles), batch_size):
+            chunk = candles[i:i + batch_size]
+            with self.conn.cursor() as cur:
+                cur.executemany(sql, [(c.symbol, c.timeframe_seconds, c.open_epoch,
+                                       c.close_epoch, c.open, c.high, c.low, c.close,
+                                       c.n_ticks, c.has_volume) for c in chunk])
 
     def record_regime(self, symbol, regime_snap, volatility_regime) -> None:
         with self.conn.cursor() as cur:

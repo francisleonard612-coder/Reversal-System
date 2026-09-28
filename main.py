@@ -87,7 +87,11 @@ async def run_live(settings: Settings) -> None:
 
 # ------------------------------------------------------------ history
 
-async def _fetch_history(settings: Settings, days: float) -> None:
+async def _fetch_history(settings: Settings, days: float, only: str | None = None) -> None:
+    """Download `days` of 1-minute candles per symbol into the DB. Resumable:
+    a symbol whose stored history already covers the window is skipped, and a
+    symbol that fails (e.g. the network drops) is reported and the run moves
+    on -- just run the command again to fill in what's missing."""
     from data.candles import candles_from_history
 
     db = _open_db(settings)
@@ -95,16 +99,28 @@ async def _fetch_history(settings: Settings, days: float) -> None:
     await client.connect()
     tf = settings["candles"]["timeframe_seconds"]
     total = int(days * 86400 / tf)
+    window_start = time.time() - days * 86400
+    failed = []
     try:
-        for sym in settings.symbols:
-            raw = await client.candle_history_paged(sym, total, granularity=tf)
-            candles = candles_from_history(sym, raw, tf)
-            for c in candles:
-                db.record_candle(c)
+        for sym in ([only] if only else settings.symbols):
+            have = db.load_candles(sym, limit=total)
+            if len(have) >= 0.97 * total and have[0].close_epoch <= window_start + 3600:
+                print(f"{sym}: already has {days:g} days stored -- skipped")
+                continue
+            try:
+                raw = await client.candle_history_paged(sym, total, granularity=tf)
+                candles = candles_from_history(sym, raw, tf)
+                db.record_candles(candles)
+            except Exception as exc:  # noqa: BLE001 - keep going with the other symbols
+                failed.append(sym)
+                print(f"{sym}: FAILED ({exc}) -- run the command again to retry")
+                continue
             span = ((candles[-1].close_epoch - candles[0].close_epoch) / 86400) if candles else 0
             print(f"{sym}: stored {len(candles)} candles ({span:.1f} days)")
     finally:
         await client.close()
+    if failed:
+        print(f"\n{len(failed)} symbol(s) incomplete: {', '.join(failed)} -- re-run to fill in")
 
 
 def _load_csv_candles(path: str, symbol: str, tf: int) -> list:
@@ -381,7 +397,7 @@ def main() -> None:
             return
 
     if args.fetch_history:
-        asyncio.run(_fetch_history(settings, args.days))
+        asyncio.run(_fetch_history(settings, args.days, args.symbol))
     elif args.backtest:
         cmd_backtest(settings, args)
     elif args.walk_forward:

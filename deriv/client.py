@@ -774,8 +774,24 @@ class DerivClient:
         out: dict[int, HistoricalCandle] = {}
         end: int | str = "latest"
         while len(out) < total:
-            page = await self.candle_history(symbol, count=min(5000, total - len(out)),
-                                             granularity=granularity, end=end)
+            # A dropped connection mid-backfill (common on mobile networks)
+            # retries the same page after reconnecting instead of failing the
+            # whole run; pages already fetched are kept.
+            for attempt in range(5):
+                try:
+                    page = await self.candle_history(symbol, count=min(5000, total - len(out)),
+                                                     granularity=granularity, end=end)
+                    break
+                except DerivAPIError as exc:
+                    if exc.code not in ("Disconnected", "Timeout") or attempt == 4:
+                        raise
+                    logger.warning("%s: history page failed (%s), reconnecting (%d/4)",
+                                   symbol, exc.code, attempt + 1)
+                    await asyncio.sleep(2 + 3 * attempt)
+                    try:
+                        await self.ensure_connected()
+                    except Exception:  # noqa: BLE001 - next attempt retries
+                        pass
             new = [c for c in page if c.epoch not in out]
             if not new:
                 break

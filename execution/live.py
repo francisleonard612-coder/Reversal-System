@@ -199,12 +199,36 @@ class LiveTrader:
                 logger.info("%s: setup threshold warmed (%s)", sym,
                             getattr(self.pipelines[sym], "threshold_source", "absolute"))
                 try:
-                    for c in seed:
-                        self.db.record_candle(c)
+                    # In a worker thread: database round trips must never block
+                    # the event loop, or Deriv's keep-alive pings go unanswered
+                    # and the socket is dropped. Persisting 999 seed candles
+                    # row-by-row on the loop (~105s from Railway to Supabase)
+                    # did exactly that and crash-looped startup.
+                    await asyncio.to_thread(self.db.record_candles, seed)
                 except Exception:
                     logger.warning("%s: could not persist seeded history", sym, exc_info=True)
-            self.queues[sym] = await self.client.subscribe_ticks(sym)
+            self.queues[sym] = await self._subscribe_with_retry(sym)
             self.last_tick_at[sym] = time.time()
+
+    async def _subscribe_with_retry(self, sym: str, attempts: int = 5):
+        """A dropped socket during startup reconnects and retries instead of
+        exiting the process (which Railway would restart into the same
+        state, up to its retry limit)."""
+        for attempt in range(attempts):
+            try:
+                return await self.client.subscribe_ticks(sym)
+            except Exception as exc:  # noqa: BLE001
+                if attempt == attempts - 1:
+                    raise
+                logger.warning("%s: tick subscribe failed (%s), retrying (%d/%d)",
+                               sym, exc, attempt + 1, attempts - 1)
+                await asyncio.sleep(2 + 3 * attempt)
+                ensure = getattr(self.client, "ensure_connected", None)
+                if ensure is not None:
+                    try:
+                        await ensure()
+                    except Exception:  # noqa: BLE001 - next attempt retries
+                        pass
 
     # --------------------------------------------------------------- loop
     async def handle_symbol(self, sym: str) -> None:
