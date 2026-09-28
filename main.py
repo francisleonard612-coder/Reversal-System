@@ -11,6 +11,8 @@ Main entry point and CLI (spec Section 51).
     python main.py --reconcile          fill counterfactual outcomes for rejected signals
     python main.py --dashboard          operating summary
     python main.py --reset-risk         operator reset of the loss-streak / daily-loss latch
+    python main.py --calibrate-expiry   backfill minute-expiry outcomes from stored candles
+    python main.py --expiry-report      current MC expiry calibration per symbol/direction
     python main.py --diagnostics | --status
 
 Backtests and training run on REAL stored candles when they exist (fill them
@@ -233,6 +235,47 @@ def cmd_train(settings: Settings, args) -> None:
         print("the live bot will refuse this model; it's saved only for inspection.")
 
 
+# ------------------------------------------------------------- expiry
+
+def _calibrator(settings: Settings, db):
+    from strategy.expiry import ExpiryCalibrator
+    ex = settings.expiry
+    cal = ExpiryCalibrator(horizons=settings.expiry_horizons, min_samples=ex["min_samples"],
+                           credible_quantile=ex["credible_quantile"], mc_draws=ex["mc_draws"],
+                           pool_symbols=ex["pool_symbols"])
+    cal.load_counts(db.setup_outcome_counts(time.time() - ex["lookback_days"] * 86400))
+    return cal
+
+
+def cmd_calibrate_expiry(settings: Settings, args) -> None:
+    """Backfill minute-expiry outcomes from stored candles so the live
+    calibrator has evidence on day one. Tick expiries can only be learned
+    live (stored history has no ticks)."""
+    from strategy.expiry import format_table, replay_setup_outcomes
+    db = _open_db(settings)
+    symbols = [args.symbol] if args.symbol else settings.symbols
+    lookback = settings.expiry["lookback_days"] * 86400
+    for sym in symbols:
+        candles = db.load_candles(sym)
+        if not candles:
+            print(f"{sym}: no stored candles -- run --fetch-history first")
+            continue
+        # replay a little more than the calibration window so the pipeline is warm
+        cutoff = candles[-1].close_epoch - lookback
+        start = max(0, next((i for i, c in enumerate(candles) if c.close_epoch >= cutoff), 0) - 450)
+        rows = replay_setup_outcomes(candles[start:], settings.raw, settings.expiry_horizons)
+        n = db.record_setup_outcomes(rows)
+        print(f"{sym}: {len(rows)} setup outcomes from {len(candles) - start} candles "
+              f"({n} new)")
+    print("\n" + format_table(_calibrator(settings, db), settings.symbols))
+
+
+def cmd_expiry_report(settings: Settings) -> None:
+    from strategy.expiry import format_table
+    db = _open_db(settings)
+    print(format_table(_calibrator(settings, db), settings.symbols))
+
+
 # ----------------------------------------------------------- operations
 
 def cmd_reconcile(settings: Settings) -> None:
@@ -297,7 +340,9 @@ def cmd_status(settings: Settings) -> None:
           f"contract={settings['contract']['duration']}{settings['contract']['duration_unit']} "
           f"horizon_matches_research={settings.horizon_matches_research} "
           f"martingale_enabled={settings.staking['martingale_enabled']} "
-          f"level2_enabled={settings.level2['enabled']} db_backend={settings.db_backend}")
+          f"level2_enabled={settings.level2['enabled']} "
+          f"expiry_calibration={settings.expiry['enabled']} "
+          f"({','.join(h.label for h in settings.expiry_horizons)}) db_backend={settings.db_backend}")
 
 
 def main() -> None:
@@ -317,6 +362,8 @@ def main() -> None:
     parser.add_argument("--reset-risk", action="store_true", dest="reset_risk")
     parser.add_argument("--note", default="")
     parser.add_argument("--status", action="store_true")
+    parser.add_argument("--calibrate-expiry", action="store_true", dest="calibrate_expiry")
+    parser.add_argument("--expiry-report", action="store_true", dest="expiry_report")
     parser.add_argument("--payout-multiple", type=float, default=1.85, dest="payout_multiple")
     args = parser.parse_args()
 
@@ -353,6 +400,10 @@ def main() -> None:
         cmd_reset_risk(settings, args.note)
     elif args.status:
         cmd_status(settings)
+    elif args.calibrate_expiry:
+        cmd_calibrate_expiry(settings, args)
+    elif args.expiry_report:
+        cmd_expiry_report(settings)
     else:
         asyncio.run(run_live(settings))
 

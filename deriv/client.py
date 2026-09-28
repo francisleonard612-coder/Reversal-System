@@ -658,6 +658,27 @@ class DerivClient:
                            f"{sorted(missing)}")
         return True, f"{symbol}: CALL and PUT confirmed available"
 
+    async def rise_fall_duration_limits(self, symbol: str) -> list[tuple]:
+        """[(min_duration, max_duration)] strings (e.g. ("1t","10t"),
+        ("15s","1d")) for plain Rise/Fall on `symbol`, from contracts_for.
+        Used to offer only expiries Deriv will actually quote. Empty list if
+        the response has no usable limits (callers then keep every horizon
+        and let proposal errors skip unsupported ones)."""
+        try:
+            resp = await self.contracts_for(symbol)
+        except DerivAPIError:
+            return []
+        out = []
+        for c in resp.get("contracts_for", {}).get("available", []):
+            if c.get("contract_type") != "CALL":
+                continue
+            if c.get("barriers") not in (None, 0, "0") and c.get("barrier_category") not in (None, "euro_atm"):
+                continue
+            lo, hi = c.get("min_contract_duration"), c.get("max_contract_duration")
+            if lo and hi:
+                out.append((str(lo), str(hi)))
+        return out
+
     async def get_pip_size(self, symbol: str) -> int | float:
         if symbol not in self._pip_sizes:
             await self.active_symbols()

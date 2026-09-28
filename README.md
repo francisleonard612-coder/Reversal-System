@@ -35,8 +35,43 @@ deployment shape.
   `--backtest` / `--walk-forward` use them (or `--data-file`), and only fall
   back to the synthetic walk with a loud warning.
 - Also: stale-feed watchdog, periodic balance refresh, reconcile on a timer,
-  `--dashboard`, `.env.example`. 120 tests (was 97), including the Postgres
+  `--dashboard`, `.env.example`. 133 tests (was 97), including the Postgres
   backend against a real Postgres (`TEST_DATABASE_URL`).
+
+## Setups and expiry (latest revision)
+
+**Why it wasn't opening trades.** The setup threshold was an absolute 55
+(77 in trends). On random-walk-like data (what Deriv volatility indices are
+built to be), ranging markets almost never score 55, and the high readings
+that do occur are nearly all counter-trend, where 77 applies. In testing,
+12,000 bars produced **zero** setups -- and on data with a real reversal
+effect planted in it, also zero.
+
+**Now: setups are the strongest readings on each symbol's own history.**
+`reversal.threshold_mode: percentile` -- a setup needs a score in the top 2%
+of the last day's bars (top 1% in transitions, 0.5% against a trend), from
+prior bars only, never below `min_absolute_score`. On the planted-reversal
+data this found setups that won ~96%; on pure noise it finds setups that win
+about half the time -- which is why quality is then *measured*, not assumed.
+
+**MC-calibrated expiry, ticks and candles** (`strategy/expiry.py`). Every
+qualifying setup is followed forward and its real outcome recorded at each
+candidate expiry -- 3/5/7/10 ticks and 1/2/3/5 minutes by default, limited to
+what Deriv offers per symbol (`setup_outcomes` table). For each expiry, Monte
+Carlo draws from the posterior win rate give a conservative (Bonferroni-
+adjusted) P(win); the best few are priced with real proposals and the trade
+is bought at the expiry with the best worst-case EV.
+
+- Until an expiry has `min_samples` (200) outcomes the bot trades the default
+  5-minute contract under Level 1 rules, so trades open from day one.
+- `--calibrate-expiry` backfills minute expiries from stored candles (run it
+  after `--fetch-history`); tick expiries are learned live.
+- `expiry.require_edge` (default on): once calibrated, a trade needs positive
+  worst-case EV. Settings were chosen by simulation: noise passes ~1.3% of
+  the time; a true 56% edge passes ~50% at 200 samples, ~94% at 800. In
+  **demo** you can set `EXPIRY_REQUIRE_EDGE=false` to keep trading the
+  best-calibrated expiry while evidence builds -- never do that live.
+- Supabase: `v_expiry_win_rates` (outcomes per expiry), `v_trades_by_expiry`.
 
 ## Recommended workflow
 
@@ -45,6 +80,8 @@ python main.py --fetch-history --days 30          # real candles into the DB
 python main.py --walk-forward --symbol R_100 --payout-multiple 1.95
 python main.py --evaluate                          # does a model beat Level 1 out of sample?
 python main.py --train                             # saves PROMOTED or REJECTED
+python main.py --calibrate-expiry                  # backfill minute-expiry outcomes
+python main.py --expiry-report                     # MC calibration per symbol/direction
 # research mode for days; then --dashboard / v_level2_calibration before demo, then live
 ```
 
@@ -219,7 +256,7 @@ bot correctly or incorrectly declined.
 ```bash
 pip install -r requirements.txt
 cp .env.example .env        # fill in DERIV_API_TOKEN at minimum
-pytest tests/ -q             # 120 tests (Postgres ones need TEST_DATABASE_URL)
+pytest tests/ -q             # 133 tests (Postgres ones need TEST_DATABASE_URL)
 
 python main.py --status
 python main.py --fetch-history --days 30

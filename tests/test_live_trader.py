@@ -252,6 +252,7 @@ def test_full_live_run_smoke(settings, db):
     from deriv.client import HistoricalCandle, TickMessage
 
     settings.symbols = ["R_100"]
+    settings.raw["candles"]["seed_bars"] = 400   # the fake tick stream below starts right after 400 bars
 
     class StreamClient(FakeClient):
         def __init__(self):
@@ -274,6 +275,9 @@ def test_full_live_run_smoke(settings, db):
         async def subscribe_ticks(self, sym):
             return self.q
 
+        async def rise_fall_duration_limits(self, sym):
+            return [("1t", "10t"), ("15s", "1d")]
+
     client = StreamClient()
     trader = LiveTrader(settings, client, db)
 
@@ -284,7 +288,10 @@ def test_full_live_run_smoke(settings, db):
             p += rnd.gauss(0, 0.05)
             t += 1
             await client.q.put(TickMessage("R_100", float(t), p, 2))
-        await asyncio.sleep(0.5)
+        for _ in range(100):                     # wait for warm-up + processing
+            await asyncio.sleep(0.1)
+            if db.conn.execute("SELECT COUNT(*) FROM signals").fetchone()[0] >= 25:
+                break
         task.cancel()
         for t_ in list(trader._tasks):
             t_.cancel()
@@ -292,3 +299,5 @@ def test_full_live_run_smoke(settings, db):
     n_signals = db.conn.execute("SELECT COUNT(*) FROM signals").fetchone()[0]
     n_candles = db.conn.execute("SELECT COUNT(*) FROM candles").fetchone()[0]
     assert n_signals >= 25 and n_candles >= 420
+    assert [h.label for h in trader.symbol_horizons["R_100"]] == \
+        ["3t", "5t", "7t", "10t", "1m", "2m", "3m", "5m"]

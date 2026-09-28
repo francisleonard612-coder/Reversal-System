@@ -15,7 +15,7 @@ import sqlite3
 import time
 from pathlib import Path
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
@@ -135,6 +135,19 @@ CREATE TABLE IF NOT EXISTS system_events (
 );
 CREATE INDEX IF NOT EXISTS idx_system_events_ts ON system_events(ts);
 
+CREATE TABLE IF NOT EXISTS setup_outcomes (
+    -- Real outcome of every qualifying setup at every candidate expiry
+    -- (strategy/expiry.py). The evidence the MC expiry calibration uses.
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL, symbol TEXT NOT NULL, setup_epoch INTEGER NOT NULL,
+    direction TEXT NOT NULL, confirmed INTEGER NOT NULL, score REAL, regime TEXT,
+    horizon TEXT NOT NULL, entry_price REAL, exit_price REAL, won INTEGER NOT NULL,
+    source TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_setup_outcomes_unique
+    ON setup_outcomes(symbol, setup_epoch, direction, horizon);
+CREATE INDEX IF NOT EXISTS idx_setup_outcomes_epoch ON setup_outcomes(setup_epoch);
+
 CREATE TABLE IF NOT EXISTS parameter_changes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts REAL NOT NULL, parameter TEXT NOT NULL, old_value TEXT, new_value TEXT,
@@ -204,6 +217,13 @@ class Database:
         for col, decl in self._V4_PREDICTION_COLUMNS:
             if col not in pred_cols:
                 self.conn.execute(f"ALTER TABLE predictions ADD COLUMN {col} {decl}")
+
+        # v4 -> v5: each trade records the expiry it was actually bought with
+        # (chosen per trade by the MC expiry calibration).
+        trade_cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(trades)")}
+        for col, decl in (("duration", "INTEGER"), ("duration_unit", "TEXT")):
+            if col not in trade_cols:
+                self.conn.execute(f"ALTER TABLE trades ADD COLUMN {col} {decl}")
 
         row = self.conn.execute("SELECT version FROM schema_version LIMIT 1").fetchone()
         if row is None:
@@ -313,13 +333,15 @@ class Database:
 
     def record_trade_open(self, *, signal_id: int, symbol: str, contract_id: int,
                           idempotency_key: str, contract_type: str, stake: float,
-                          payout: float, buy_price: float, entry_spot: float) -> int:
+                          payout: float, buy_price: float, entry_spot: float,
+                          duration: int | None = None, duration_unit: str | None = None) -> int:
         cur = self.conn.execute(
             """INSERT INTO trades (signal_id, ts, symbol, contract_id,
-               idempotency_key, contract_type, stake, payout, buy_price, entry_spot)
-               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+               idempotency_key, contract_type, stake, payout, buy_price, entry_spot,
+               duration, duration_unit)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
             (signal_id, time.time(), symbol, contract_id, idempotency_key,
-             contract_type, stake, payout, buy_price, entry_spot))
+             contract_type, stake, payout, buy_price, entry_spot, duration, duration_unit))
         self.conn.commit()
         return cur.lastrowid
 
@@ -413,6 +435,27 @@ class Database:
              json.dumps(features), json.dumps(parameters), calibration_method,
              promotion_status))
         self.conn.commit()
+
+    def record_setup_outcomes(self, rows: list[dict]) -> int:
+        """Idempotent on (symbol, setup_epoch, direction, horizon): replaying
+        the same history twice, or a live outcome for a candle already
+        replayed, adds nothing."""
+        cur = self.conn.executemany(
+            "INSERT OR IGNORE INTO setup_outcomes (ts, symbol, setup_epoch, direction, "
+            "confirmed, score, regime, horizon, entry_price, exit_price, won, source) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            [(time.time(), r["symbol"], r["setup_epoch"], r["direction"], int(r["confirmed"]),
+              r.get("score"), r.get("regime"), r["horizon"], r.get("entry_price"),
+              r.get("exit_price"), int(r["won"]), r["source"]) for r in rows])
+        self.conn.commit()
+        return cur.rowcount
+
+    def setup_outcome_counts(self, since_epoch: float = 0) -> list[tuple]:
+        """(symbol, direction, horizon, confirmed, wins, n) for the calibrator."""
+        return [tuple(r) for r in self.conn.execute(
+            "SELECT symbol, direction, horizon, confirmed, SUM(won), COUNT(*) "
+            "FROM setup_outcomes WHERE setup_epoch >= ? "
+            "GROUP BY symbol, direction, horizon, confirmed", (since_epoch,))]
 
     def dashboard(self, day_start: float) -> dict:
         """One-call operating summary for `--dashboard`."""

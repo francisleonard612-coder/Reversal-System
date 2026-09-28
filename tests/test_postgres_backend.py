@@ -61,3 +61,16 @@ def test_candles_predictions_models_dashboard(pg):
     d = pg.dashboard(0)
     assert d["predictions"]["n"] == 1 and d["latest_model"]["promotion_status"] == "REJECTED"
     assert d["candles_stored"] == {"R_100": 3}
+
+
+def test_setup_outcomes_and_trade_expiry(pg):
+    row = {"symbol": "R", "setup_epoch": 60, "direction": "bullish", "confirmed": True,
+           "horizon": "1m", "won": True, "source": "replay"}
+    assert pg.record_setup_outcomes([row, {**row, "horizon": "5t", "won": False}]) == 2
+    assert pg.record_setup_outcomes([row]) == 0
+    assert sorted(pg.setup_outcome_counts()) == [("R", "bullish", "1m", True, 1, 1),
+                                                 ("R", "bullish", "5t", True, 0, 1)]
+    pg.record_trade_open(signal_id=None, symbol="R", contract_id=9, idempotency_key="9",
+                         contract_type="CALL", stake=1, payout=1.9, buy_price=1, entry_spot=1,
+                         duration=5, duration_unit="t")
+    assert pg.open_trades()[0]["contract_id"] == 9

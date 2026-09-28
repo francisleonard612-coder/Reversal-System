@@ -13,6 +13,9 @@ themselves -- the pending setup awaiting confirmation.
 from __future__ import annotations
 
 import time
+from collections import deque
+
+import numpy as np
 from dataclasses import dataclass
 
 from features.engine import FeatureSnapshot
@@ -33,6 +36,27 @@ class SymbolPipeline:
         self.last_evidence: BarEvidence | None = None
         self.last_decision: Decision | None = None
         self.n_available = 0
+        rc = cfg["reversal"]
+        self._scores: deque = deque(maxlen=int(rc.get("score_history_bars", 1440)))
+
+    def effective_threshold(self, regime: str, regime_multiplier: float) -> tuple[float, str]:
+        """The score a setup must reach on this bar, and how it was set.
+        Uses only scores from bars BEFORE this one."""
+        rc = self.cfg["reversal"]
+        base = rc["setup_threshold"]
+        if rc.get("threshold_mode", "absolute") == "percentile" and \
+                len(self._scores) >= rc.get("min_score_history", 300):
+            pct = rc.get("setup_percentile", {}).get(regime, 98.0)
+            value = max(float(np.percentile(self._scores, pct)), rc.get("min_absolute_score", 0.0))
+            return value, f"p{pct:g} of last {len(self._scores)} bars"
+        return base * regime_multiplier, "absolute"
+
+    def warm(self, candles: list, start: int = 0) -> None:
+        """Replay seed history so the percentile threshold (and any setup
+        already in progress) is in place before the first live bar."""
+        max_lookback = self.cfg["candles"].get("max_lookback_bars", 400)
+        for i in range(max(start, 0), len(candles)):
+            self.evaluate_on_close(candles[max(0, i + 1 - max_lookback): i + 1])
 
     def features_for_direction(self, direction: str) -> dict | None:
         """Level 2 feature vector for a trade in `direction` on the bar just
@@ -80,7 +104,9 @@ class SymbolPipeline:
 
         feat, regime_snap, score = ev.feat, ev.regime_snap, ev.score
         multiplier = ev.regime_multiplier
-        threshold = cfg["reversal"]["setup_threshold"]
+        base_threshold = cfg["reversal"]["setup_threshold"]
+        threshold, self.threshold_source = self.effective_threshold(regime_snap.regime, multiplier)
+        self._scores.append(max(score.bullish, score.bearish))
         bar_index = feat.candle_index   # always len(window)-1: last position, for array access only
 
         # Update or create the pending setup for whichever direction (if
@@ -88,8 +114,8 @@ class SymbolPipeline:
         # Section 17 describes setup -> confirmation as a single-threaded
         # progression, and the conflicting-signal case is a hard NO_TRADE
         # in decision_engine.py, not something this layer needs to arbitrate.
-        bull_qualifies = score.bullish >= threshold * multiplier
-        bear_qualifies = score.bearish >= threshold * multiplier
+        bull_qualifies = score.bullish >= threshold
+        bear_qualifies = score.bearish >= threshold
 
         if self._pending_setup is None and bull_qualifies and not bear_qualifies:
             self._pending_setup = PendingSetup(
@@ -126,7 +152,7 @@ class SymbolPipeline:
             symbol=self.symbol, timestamp=now, sufficient_data=True,
             regime=regime_snap.regime, volatility_regime=feat.volatility.volatility_regime,
             bullish_score=score.bullish, bearish_score=score.bearish,
-            setup_threshold=threshold, regime_multiplier=multiplier,
+            setup_threshold=base_threshold, regime_multiplier=threshold / base_threshold,
             disable_on_high_vol=cfg["regime"]["disable_on_high_vol"],
             confirmed_direction=confirmed_direction,
             confirmation_reason=confirmation_reason)

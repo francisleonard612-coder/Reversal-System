@@ -138,6 +138,21 @@ alter table predictions add column if not exists payout_multiple double precisio
 alter table predictions add column if not exists expected_value double precision;
 create index if not exists idx_predictions_signal on predictions(signal_id);
 
+-- v5: MC-calibrated expiry (strategy/expiry.py). Every qualifying setup's
+-- real outcome at every candidate expiry, and the expiry each trade used.
+create table if not exists setup_outcomes (
+    id bigserial primary key,
+    ts double precision not null, symbol text not null, setup_epoch bigint not null,
+    direction text not null, confirmed boolean not null, score double precision,
+    regime text, horizon text not null, entry_price double precision,
+    exit_price double precision, won boolean not null, source text not null
+);
+create unique index if not exists idx_setup_outcomes_unique
+    on setup_outcomes(symbol, setup_epoch, direction, horizon);
+create index if not exists idx_setup_outcomes_epoch on setup_outcomes(setup_epoch);
+alter table trades add column if not exists duration integer;
+alter table trades add column if not exists duration_unit text;
+
 -- ===========================================================================
 -- Views
 -- ===========================================================================
@@ -186,6 +201,24 @@ where t.settled_at is not null
 group by 1
 order by 1;
 
+-- Which expiry does each kind of setup actually resolve best at?
+create or replace view v_expiry_win_rates as
+select symbol, direction, horizon, confirmed, source,
+       count(*) n,
+       round(avg(case when won then 1.0 else 0.0 end)::numeric, 4) win_rate
+from setup_outcomes
+group by symbol, direction, horizon, confirmed, source
+order by symbol, direction, confirmed desc, win_rate desc;
+
+-- Real results by the expiry each trade was bought with.
+create or replace view v_trades_by_expiry as
+select symbol, duration || coalesce(duration_unit, '') as expiry,
+       count(*) trades, count(*) filter (where won) wins,
+       round(avg(case when won then 1.0 else 0.0 end)::numeric, 4) win_rate,
+       round(sum(pnl)::numeric, 2) pnl
+from trades where settled_at is not null
+group by 1, 2 order by 1, 2;
+
 create or replace view v_counterfactual_summary as
 select symbol, reason_code,
        count(*) filter (where outcome_evaluated) n_evaluated,
@@ -206,12 +239,13 @@ alter table trades             enable row level security;
 alter table rejected_signals   enable row level security;
 alter table regime_history     enable row level security;
 alter table system_events      enable row level security;
+alter table setup_outcomes     enable row level security;
 
 do $$
 declare t text;
 begin
     foreach t in array array['signals','trades','rejected_signals',
-                             'regime_history','system_events']
+                             'regime_history','system_events','setup_outcomes']
     loop
         execute format('drop policy if exists %I on %I', 'read_only_authenticated', t);
         execute format('create policy %I on %I for select to authenticated using (true)',
