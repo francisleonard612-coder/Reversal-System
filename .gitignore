@@ -3,3 +3,7 @@ __pycache__/
 .env
 data/*.db
 data/*.db-*
+data/research/
+data/research_selftest/
+data/cache/
+data/*.csv
