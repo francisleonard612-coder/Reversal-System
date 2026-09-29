@@ -7,3 +7,5 @@ data/research/
 data/research_selftest/
 data/cache/
 data/*.csv
+research/candles/
+research/*.pkl
