@@ -44,7 +44,7 @@ import sys
 import time
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -221,7 +221,7 @@ async def sample_payouts(symbols: list[str]) -> dict:
                 rows.append({"symbol": s, "minutes": m,
                              "payout_multiple": round(res[(s, m)], 4) if (s, m) in res else "",
                              "break_even": round(1 / res[(s, m)], 4) if (s, m) in res else "",
-                             "sampled_utc": datetime.utcnow().strftime("%Y-%m-%d %H:%M")})
+                             "sampled_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")})
             got = sum(1 for m in EXPIRIES if (s, m) in res)
             print(f"  payouts {s}: {got}/{len(EXPIRIES)} expiries quoted")
     finally:
@@ -232,6 +232,10 @@ async def sample_payouts(symbols: list[str]) -> dict:
 
 # ============================================================ helpers
 
+def _utc(epoch) -> datetime:
+    return datetime.fromtimestamp(int(epoch), timezone.utc)
+
+
 def pair_ccys(sym: str):
     return (sym[3:6], sym[6:9]) if sym.startswith("frx") and len(sym) == 9 else (None, None)
 
@@ -241,8 +245,8 @@ def local_epoch(tz: str, d: date, hm) -> int:
 
 
 def days_between(t0: int, t1: int):
-    d = datetime.utcfromtimestamp(t0).date() - timedelta(days=1)
-    end = datetime.utcfromtimestamp(t1).date() + timedelta(days=1)
+    d = _utc(t0).date() - timedelta(days=1)
+    end = _utc(t1).date() + timedelta(days=1)
     while d <= end:
         yield d
         d += timedelta(days=1)
@@ -502,14 +506,35 @@ def outcomes(S: dict, events):
 
 
 def binom_sf(w: int, n: int, p: float) -> float:
-    """P(X >= w) for X ~ Binomial(n, p)."""
-    from scipy.stats import binom
-    return float(binom.sf(w - 1, n, p))
+    """P(X >= w) for X ~ Binomial(n, p). Exact, pure Python (no scipy: some
+    Windows Application Control policies block scipy's compiled parts)."""
+    if w <= 0:
+        return 1.0
+    if w > n:
+        return 0.0
+    if p <= 0:
+        return 0.0
+    if p >= 1:
+        return 1.0
+    lp, lq = math.log(p), math.log1p(-p)
+    logs = [math.lgamma(n + 1) - math.lgamma(k + 1) - math.lgamma(n - k + 1) + k * lp + (n - k) * lq
+            for k in range(w, n + 1)]
+    m = max(logs)
+    return min(1.0, math.exp(m) * sum(math.exp(x - m) for x in logs))
 
 
 def beta_lower(w: int, n: int, q: float) -> float:
-    from scipy.stats import beta
-    return float(beta.ppf(q, w + 1, n - w + 1))
+    """q-quantile of Beta(w+1, n-w+1), exact via the Beta-Binomial identity
+    P(Beta(a, b) <= x) = P(Binomial(a+b-1, x) >= a), solved by bisection."""
+    a, N = w + 1, n + 1
+    lo, hi = 0.0, 1.0
+    for _ in range(60):
+        mid = (lo + hi) / 2
+        if binom_sf(a, N, mid) < q:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2
 
 
 def evaluate(rows, cut_epoch: int, payouts: dict):
@@ -606,8 +631,8 @@ def _write_csv(name, rows):
 
 def run_analysis(raw: dict, payouts: dict, label: str) -> str:
     S = {s: make_series(s, *tc) for s, tc in raw.items()}
-    cov = [{"symbol": s, "bars": len(x.t), "first_utc": datetime.utcfromtimestamp(int(x.t[0])).strftime("%Y-%m-%d"),
-            "last_utc": datetime.utcfromtimestamp(int(x.t[-1])).strftime("%Y-%m-%d"),
+    cov = [{"symbol": s, "bars": len(x.t), "first_utc": _utc(int(x.t[0])).strftime("%Y-%m-%d"),
+            "last_utc": _utc(int(x.t[-1])).strftime("%Y-%m-%d"),
             "days": round((x.t[-1] - x.t[0]) / 86400, 1)} for s, x in sorted(S.items())]
     _write_csv("data_coverage.csv", cov)
 
@@ -629,9 +654,9 @@ def run_analysis(raw: dict, payouts: dict, label: str) -> str:
     _write_csv("family_pooled.csv", pooled)
 
     L = [f"RISE/FALL RESEARCH -- {label}",
-         f"generated {datetime.utcnow():%Y-%m-%d %H:%M} UTC",
+         f"generated {datetime.now(timezone.utc):%Y-%m-%d %H:%M} UTC",
          f"symbols with data: {len(S)}   events: {len(events):,}",
-         f"discovery before {datetime.utcfromtimestamp(cut):%Y-%m-%d}, validation after "
+         f"discovery before {_utc(cut):%Y-%m-%d}, validation after "
          f"(picks tested: {K}, Bonferroni alpha {ALPHA / K:.1e})",
          f"live payouts sampled: {len(payouts)} symbol-expiry pairs"
          + ("" if payouts else f" -- NONE, break-even assumes {DEFAULT_PAYOUT}x"), ""]
@@ -671,7 +696,7 @@ def synthetic(days=730, planted=True, seed=3):
     rng = np.random.default_rng(seed)
     start = int(datetime(2025, 1, 6, tzinfo=ZoneInfo("UTC")).timestamp())
     t = np.arange(start, start + days * 86400, BAR)
-    t = t[[datetime.utcfromtimestamp(int(x)).weekday() < 5 for x in t]]
+    t = t[[_utc(int(x)).weekday() < 5 for x in t]]
     syms = ["frxEURUSD", "frxGBPUSD", "frxUSDJPY", "frxAUDUSD", "OTC_SPC", "OTC_GDAXI",
             "OTC_N225", "OTC_SX5E", RISK]
     out = {}
