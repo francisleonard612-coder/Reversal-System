@@ -204,6 +204,10 @@ def run_symbol(args):
                     busy[mode] = t + D
         sink.seek(0)
         sink.truncate()
+        if evals and evals % 250 == 0:
+            el = time.time() - t0
+            print(f"[progress] {sym}: {evals} evals, {len([x for x in trades if x[0]=='default'])} trades, "
+                  f"{el / 60:.1f} min, {el / evals:.2f}s/eval", file=sys.stderr, flush=True)
     secs = time.time() - t0
     return sym, trades, diag, reasons, evals, secs
 
