@@ -491,7 +491,7 @@ MIN_SCORE_GAP = 0.05
 # does not by itself un-stick the value already persisted in Supabase from
 # before that fix existed -- this version bump is what actually clears it,
 # the same way it did for the 2026-07-29 incident.
-GATE_SCHEMA_VERSION = 5
+GATE_SCHEMA_VERSION = 6   # bumped: discard gates saved by the pre-fix, Rise-only bot
 
 # ── Layer agreement gate ──────────────────────────────────────────────────
 # FIX v3: Lowered 12/3 → 9/4 based on actual demo log analysis (2026-06-30).
