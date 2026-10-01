@@ -51,7 +51,7 @@ def runs_test(s):
     """Wald-Wolfowitz on the sign sequence (zeros dropped). Returns z
     (negative = streaks LONGER than chance, positive = more alternation)."""
     s = s[s != 0]
-    n1, n2 = (s > 0).sum(), (s < 0).sum()
+    n1, n2 = float((s > 0).sum()), float((s < 0).sum())
     n = n1 + n2
     runs = 1 + np.count_nonzero(s[1:] != s[:-1])
     mu = 2 * n1 * n2 / n + 1
