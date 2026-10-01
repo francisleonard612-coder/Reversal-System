@@ -491,7 +491,8 @@ MIN_SCORE_GAP = 0.05
 # does not by itself un-stick the value already persisted in Supabase from
 # before that fix existed -- this version bump is what actually clears it,
 # the same way it did for the 2026-07-29 incident.
-GATE_SCHEMA_VERSION = 6   # bumped: discard gates saved by the pre-fix, Rise-only bot
+STATE_SCHEMA_VERSION = 2   # bump to discard saved per-symbol state / direction history
+GATE_SCHEMA_VERSION = 7   # bumped: discard gates loosened by the starvation-breaker bug (agree 4 / disagree 8)
 
 # ── Layer agreement gate ──────────────────────────────────────────────────
 # FIX v3: Lowered 12/3 → 9/4 based on actual demo log analysis (2026-06-30).
@@ -611,11 +612,15 @@ MIN_TICKS_LIVE = 60
 # SCHEDULED_CALIBRATION_INTERVAL is now a maximum backstop, not a trigger.
 SCHEDULED_CALIBRATION_INTERVAL = 6 * 60 * 60   # 6-hour absolute backstop
 CALIBRATION_COOLDOWN = 5 * 60
+# Minimum gap between a calibration and a DRIFT-triggered one (trading is
+# locked for the whole recalibration; at 5 minutes the bot was locked almost
+# permanently).
+DRIFT_RECAL_MIN_INTERVAL = float(os.getenv("DRIFT_RECAL_MIN_INTERVAL", "3600"))
 
 # ── v3: Drift detection thresholds ────────────────────────────────────────
 # KS test: p-value threshold below which return distribution is flagged as
 # shifted. ks_2samp(train_returns, live_returns).pvalue < KS_P_THRESHOLD.
-KS_P_THRESHOLD        = 0.05
+KS_P_THRESHOLD        = float(os.getenv("KS_P_THRESHOLD", "0.001"))   # was 0.05: fired by chance within minutes
 
 # PSI: Population Stability Index for confidence scores.
 # PSI < 0.1 = stable, 0.1-0.25 = slight shift, > 0.25 = major shift.
@@ -3209,6 +3214,10 @@ class ConfidenceCalibrator:
         res = minimize(nll, x0=[1.0], method="Nelder-Mead",
                        options={"xatol": 1e-4, "maxiter": 200})
         T = float(max(res.x[0], 0.1))
+        # FIX: when confidences carry no information the optimiser runs away
+        # (T ~ 5e12 seen live), which squashes every p_up to exactly 0.5 and
+        # turns every signal on that symbol into a zero-confidence PUT.
+        T = float(np.clip(T, 0.5, 3.0))
         print(f"[Calibrate] Temperature T={T:.3f} "
               f"({'soften' if T>1.1 else 'sharpen' if T<0.9 else 'neutral'})")
         return T
@@ -3593,6 +3602,7 @@ def maybe_recalibrate_gate(state):
                       f"disagree {MAX_LAYER_DISAGREE}->{new_dis}")
                 MIN_LAYER_AGREE, MAX_LAYER_DISAGREE = new_agree, new_dis
                 state.last_gate_recalib_time = now
+                state.last_trade_time = now   # FIX: one emergency step per starvation window, not one per scan
                 if _store:
                     _store.save_gates(MIN_LAYER_AGREE, MAX_LAYER_DISAGREE,
                                       MIN_EXP_WIN_RATE, state.adaptive_threshold)
@@ -4624,7 +4634,7 @@ def check_calibration_triggers(state, symbol_data=None):
     if now - state.last_calibration_end < CALIBRATION_COOLDOWN:
         return None
     flagged = [s for s, degraded in state.drift_degraded.items() if degraded]
-    if flagged:
+    if flagged and now - state.last_calibration_end >= DRIFT_RECAL_MIN_INTERVAL:
         print(f"[Recal] Drift detected on {flagged} — event-driven recalibration")
         return "drift", flagged
     if now - state.last_scheduled_calibration >= SCHEDULED_CALIBRATION_INTERVAL:
@@ -5062,6 +5072,10 @@ async def deep_startup_calibration(state, symbol_data, symbols):
           f"lower reliability multiplier means they need a stronger signal to win selection.")
 
     elapsed = time.time() - start
+    # FIX: the starvation clock ran through the ~27-minute startup calibration,
+    # so the breaker fired six times in 20 seconds the moment scanning began
+    # (agree 10->4). Time spent calibrating is not time spent failing to trade.
+    state.last_trade_time = time.time()
     print(f"\n[DeepCal] Complete in {elapsed:.1f}s ({elapsed/60:.1f} min). Bot armed.")
     print("=" * 60)
 
@@ -5234,6 +5248,7 @@ async def run_calibration(state, symbol_data, symbols, trigger_reason):
 
     state.last_scheduled_calibration = time.time()
     state.last_calibration_end = time.time()
+    state.last_trade_time = max(state.last_trade_time, time.time() - GATE_STARVATION_SECS / 2)
     state.last_activity = time.time()
 
     # v14: surface conviction_outcome_report() every cycle instead of never.
@@ -5339,8 +5354,25 @@ async def main():
     # ── Supabase: init store and warm-start from persisted state ──────────
     global _store, MIN_LAYER_AGREE, MAX_LAYER_DISAGREE, MIN_EXP_WIN_RATE
     _store = SupabaseStore()
-    _store.load_symbol_state(state)
-    _store.load_global_state(state)   # FIX v2: restore direction_history
+    # Saved state (win-rate windows, reliabilities, direction history) written
+    # by a different STATE_SCHEMA_VERSION comes from a bot that behaved
+    # differently (the original was Rise-only with a 16% recorded win rate);
+    # loading it made AutoTune tighten the gates before the first trade.
+    _state_rows = _store._select("bot_global_state", "select=key,value") or []
+    _saved_ver = next((r.get("value") for r in _state_rows if r.get("key") == "state_schema_version"), None)
+    try:
+        _saved_ver = int(float(json.loads(_saved_ver) if isinstance(_saved_ver, str) else _saved_ver))
+    except Exception:
+        _saved_ver = None
+    if _saved_ver == STATE_SCHEMA_VERSION:
+        _store.load_symbol_state(state)
+        _store.load_global_state(state)   # FIX v2: restore direction_history
+    else:
+        print(f"[Store] Saved state is from schema {_saved_ver} (current {STATE_SCHEMA_VERSION}) "
+              f"-- ignoring it, cold start.")
+        _store._upsert("bot_global_state", {"key": "state_schema_version",
+                                            "value": json.dumps(STATE_SCHEMA_VERSION),
+                                            "updated_at": datetime.utcnow().isoformat()})
     gates = _store.load_gates()
     if gates:
         MIN_LAYER_AGREE    = int(gates.get("min_layer_agree",    MIN_LAYER_AGREE))
@@ -5394,11 +5426,14 @@ async def main():
     for s in r_symbols:
         symbol_data[s] = SymbolData(s, tick_dt=2.0)   # R_ tick ~every 2s
     for s in hz_symbols:
-        symbol_data[s] = SymbolData(s, tick_dt=1.0)   # 1HZ ticks every 1s
+        symbol_data[s] = SymbolData(s, maxlen=24000, tick_dt=1.0)   # 1HZ: 1 tick/s -> 400 min of bars
 
     print(f"Bootstrapping tick history for all symbols (target: {HISTORY_BOOTSTRAP_COUNT} ticks each)...")
     for s in symbols:
-        history = await fetch_history(client, s)
+        # FIX: minute models need 200+ one-minute bars. 10,000 ticks is 333 min on
+        # R_ (2s ticks) but only 166 min on 1HZ, so 1HZ symbols could never trade.
+        history = await fetch_history(client, s, count=(HISTORY_BOOTSTRAP_COUNT * 3) // 2
+                                      if s.startswith("1HZ") else HISTORY_BOOTSTRAP_COUNT)
         for epoch, price in history:
             symbol_data[s].add_tick(epoch, price)
         actual_dt = symbol_data[s].mean_tick_dt()
