@@ -1,0 +1,6488 @@
+"""
+Deriv Multi-Symbol Rise/Fall Trading Bot - FULL POWER  v3
+==========================================================
+Single-file bot. Scans all eligible synthetic-index symbols, runs an
+18-layer intelligence pipeline per symbol using fitted statistical models,
+fuses evidence via a meta-learner with Bayesian fallback, auto-selects trade
+duration via Monte Carlo simulation, and allocates capital across symbols
+by edge × confidence × correlation adjustment.
+
+v4 UPGRADE (2026-07-28) — HMM/GBM ADVANCED MONTE CARLO:
+─────────────────────────────────────────────────────────────────
+  Adds hmm_gbm_scan() (regime-conditional GBM sampler) built on TOP of
+  this file's existing per-symbol hmmlearn GaussianHMM (fit_hmm(), "Layer
+  2" -- already fit every cycle, cached as models.hmm_model). No new HMM
+  dependency and no duplicate fitting -- see hmm_gbm_scan() and its call
+  sites for details.
+
+v5 CORRECTION (2026-07-28, same day) — Gate 5 downgraded to diagnostic:
+─────────────────────────────────────────────────────────────────
+  v4 wired hmm_gbm_scan() in as a hard required-agreement gate (the trade
+  only fired if the MC's direction matched the layer stack's). That was
+  too strict given this file's OWN documented finding just above ("genuine
+  random-walk synthetics only produce ~0.50-0.51 from simulation"): if the
+  MC's direction call is close to a coin flip, requiring it to agree with
+  the layer stack discards roughly HALF of otherwise-good signals for no
+  real edge. Confirmed as the likely cause of a real trade-frequency
+  complaint the same day this was added. Gate 5 is now diagnostic-only
+  (logged, doesn't block) -- same treatment the EXPIRYRANGE bot's
+  classify_regime() already gets. Duration selection via
+  monte_carlo_duration()'s HMM/GBM-blended terminal distribution is
+  unaffected and still active.
+
+v6 UPGRADE (2026-07-29) — Gate 5 becomes confidence-gated:
+─────────────────────────────────────────────────────────────────
+  v5's fully-diagnostic Gate 5 meant a coin-flip-ish MC read could never
+  even matter as a second opinion, on any trade. Middle ground: Gate 5 now
+  REQUIRES agreement only when the layer stack's own signal is borderline
+  (score < MC_BORDERLINE_MULTIPLIER x its qualifying threshold) -- a signal
+  that clears its threshold by a wide margin fires regardless, since a
+  coin-flip MC read has nothing useful to add there. This targets the
+  actual case where a second opinion could plausibly change the right
+  call, without taxing every single trade the way v4 did. See
+  MC_BORDERLINE_MULTIPLIER's constant comment for the exact rule.
+
+  HONEST CAVEAT (already documented lower in this file, worth repeating
+  here): "genuine random-walk synthetics only produce ~0.50-0.51 from
+  simulation... the real edge comes from the layer stack, not the MC
+  simulation alone." That finding doesn't change just because the MC
+  got more advanced -- an HMM/GBM engine models regime (vol clustering,
+  short-lived momentum bursts) better than a flat Gaussian, but it is
+  NOT expected to out-predict a true random walk's direction on its own.
+  So hmm_gbm_scan() is wired in as a REQUIRED-AGREEMENT gate on direction
+  (the trade only fires if the MC's own independent read agrees with the
+  layer-stack's pick, same principle as the existing bootstrap agreement
+  check) rather than as a silent override of the validated layer/meta-
+  learner pipeline. Duration selection is genuinely upgraded (see
+  monte_carlo_duration()'s new HMM/GBM-blended terminal distribution).
+
+UPGRADE 1 — Drift Detection (KS + PSI + CUSUM).
+  Three independent degradation detectors run continuously:
+  · KS-test: return distribution shift vs. training window
+  · PSI: confidence score population stability index
+  · CUSUM: sequential win-rate degradation detector
+  Any single detector firing triggers immediate recalibration AND
+  a stake reduction to 50% of normal until the model is fresh again.
+  Replaces blind 2-hour fixed-interval recalibration.
+
+UPGRADE 2 — Meta-Learner Fusion (replaces Bayesian log-odds).
+  A logistic-regression meta-model trained on per-layer OOS outputs → 
+  actual trade outcomes replaces the static weighted log-odds fusion.
+  Learns interaction effects between correlated layers (RSI↔StochRSI,
+  HMM↔ARFIMA, Kalman↔OU) that additive log-odds cannot capture.
+  Graceful fallback to Bayesian fusion when <200 training samples exist.
+
+UPGRADE 3 — Confidence Calibration (temperature scaling + isotonic).
+  Raw model confidence scores are systematically overconfident (live logs
+  showed parametric MC at 0.92 vs bootstrap at 0.50). Temperature scaling
+  recalibrates so 80% confidence → ~80% actual win rate. Isotonic
+  regression provides a monotonic fallback for non-monotonic curves.
+  Directly fixes Kelly stake over-sizing from uncalibrated confidence.
+
+UPGRADE 4 — Event-Driven Recalibration.
+  Fixed 2-hour timer replaced by drift-score trigger. Recalibration fires
+  on genuine model degradation, not the clock. 6-hour absolute backstop
+  prevents indefinite stale-model running. Reduces unnecessary compute
+  during stable regimes and responds faster during actual regime shifts.
+
+UPGRADE 5 — Portfolio Risk Allocation.
+  Best-signal-wins replaced by simultaneous multi-symbol allocation.
+  Each symbol's stake = kelly_fraction × edge × (1 - correlation_penalty).
+  Correlated symbol pairs (e.g. R_75 + R_100) share reduced combined
+  allocation; genuinely uncorrelated pairs (R_10 + R_100) get near-full
+  allocation each. Max 3 concurrent positions, total risk capped at 6%
+  of balance. Enforced by PortfolioAllocator class.
+
+
+v2 FIXES (applied 2026-06-29 from live log + Supabase analysis):
+─────────────────────────────────────────────────────────────────
+FIX 1 — hurst_rs() now computed on LOG-RETURNS not absolute prices.
+         Root cause of H=1.0 on every tick, which caused hurst_signal=+1.0
+         always and forced momentum_mode=True permanently, injecting a
+         structural CALL-only bias into every Bayesian fusion.
+
+FIX 2 — hmm_trend_weight() lean now normalised by return std.
+         HMM state means are O(1e-4) for synthetic index returns; tanh(1e-4
+         × 200) ≈ 0.02 — the HMM layer was effectively silent. Normalising
+         by std makes the signal dimensionless and reaches ±1 naturally.
+
+FIX 3 — compute_adx() trend threshold lowered 20 → 12 for tick data.
+         Tick-level ADX on synthetics rarely exceeds 20, so trend_strength
+         was permanently 0 and adx_dir contributed nothing to the gate.
+
+FIX 4 — momentum_mode h-threshold raised 0.52 → 0.58.
+         True random-walk synthetics have H ≈ 0.50 ± 0.05 on returns.
+         The 0.52 threshold was inside measurement noise, enabling spurious
+         momentum mode even on genuinely mean-reverting regimes.
+
+FIX 5 — Direction balance correction in bayesian_fusion().
+         When recent CALL/PUT ratio exceeds 80/20, a soft log-odds penalty
+         (capped at ±0.5) dampens runaway one-sided bias as a safety net.
+
+FIX 6 — MARTINGALE_MAX_STEPS reduced 3 → 2 + MAX_SEQUENCE_LOSS_PCT guard.
+         3-step martingale at 2% risk could consume 11.4% of balance per
+         failed sequence. Hard cap at 5% of balance aborts the sequence
+         before it can destroy the account. This is the structural fix for
+         the $12,000 → $7.54 account destruction.
+
+FIX 7 — POST_LOSS_DEEP_RECAL disabled (False).
+         Every loss was triggering 688-second full recalibration (11.5 min),
+         locking trading after each of the 41% losing trades. The scheduled
+         2-hour recal is sufficient; per-loss recal was redundant and was
+         calibrating on corrupted Hurst features anyway.
+
+FIX 8 — MIN_EXP_WIN_RATE lowered 0.52 → 0.505.
+         MC was blocking 186 signals because genuine random-walk synthetics
+         only simulate to ~0.50-0.51. The layer gate does primary selection;
+         MC's role is to pick the best duration, not gate the trade.
+
+FIX 9 — MC_SIMULATIONS reduced 50000 → 8000.
+         Statistical error at 8000 paths = ±0.006, sufficient to distinguish
+         0.52 from 0.505. Reduces calibration time by ~80%.
+
+FIX 10 — Walk-forward folds 5 → 3, step 3 → 5.
+          Cuts calibration wall time from ~688s to ~200-250s.
+
+FIX 11 — Direction history tracking (last 30 trades) for bias monitoring.
+          Logs a warning when CALL/PUT ratio exceeds 80/20.
+
+MODEL FITTING vs LIVE SCORING
+------------------------------
+Fitting HMM/GARCH/Hawkes/OU is computationally expensive, so it only happens
+during calibration: once at startup (full universe), then every 2 hours
+(top-K deep dive) or after 2 consecutive losses on a symbol (rate-limited,
+that symbol's deep dive). Live trading between calibrations just evaluates
+the cached fitted models against new ticks - cheap, fast, no refitting.
+
+Symbols without a fitted model yet (before their first calibration) return
+no signal and are simply not eligible for selection - this is automatic
+and correct, no special-casing needed.
+
+CONNECTION: new Deriv Options API (REST OTP bootstrap), verified against
+developers.deriv.com as of 2026-06:
+    REST  GET  /trading/v1/options/accounts            -> resolve account_id
+    REST  POST /trading/v1/options/accounts/{id}/otp    -> pre-auth WS URL
+    No `authorize` message needed - the OTP URL is already authenticated.
+    OTP tokens are short-lived/single-use, so a fresh one is fetched on
+    every (re)connect; the client auto-reconnects with backoff and replays
+    subscriptions (balance + ticks for every symbol) after each reconnect.
+    `active_symbols` no longer accepts `product_type`; its response field
+    is `underlying_symbol` (not `symbol`). `contracts_for` no longer takes
+    `currency`. Buy `parameters` now requires `underlying_symbol` (not
+    `symbol`). Tick responses keep the `symbol` field unchanged.
+
+ENV VARS REQUIRED:
+    DERIV_APP_ID        - your app_id from a NEW developers.deriv.com application
+                           (legacy app_ids, e.g. the old demo id 1089, do NOT
+                           work with the new Options API)
+    DERIV_API_TOKEN     - API token (personal access token) for your Deriv account
+    DERIV_ACCOUNT_TYPE  - "demo" (default, safe) or "real". Picked explicitly
+                           rather than guessed, so the bot never trades on
+                           your real-money account by accident.
+    DERIV_ACCOUNT_ID    - optional; skips the accounts lookup and uses this
+                           account_id directly
+
+SUPABASE PERSISTENCE (Railway has no persistent filesystem):
+    SUPABASE_URL        - e.g. https://xxxxxxxxxxxx.supabase.co
+    SUPABASE_KEY        - service_role key from Supabase Settings → API
+
+    Run this SQL once in Supabase SQL editor before first Railway deploy:
+
+        CREATE TABLE IF NOT EXISTS bot_trade_log (
+            id          BIGSERIAL PRIMARY KEY,
+            ts          TIMESTAMPTZ DEFAULT now(),
+            symbol      TEXT,
+            direction   INTEGER,
+            step        INTEGER,
+            stake       REAL,
+            won         BOOLEAN,
+            profit      REAL,
+            p_up        REAL,
+            confidence  REAL,
+            conviction  REAL,
+            duration    INTEGER,
+            layer_votes JSONB,
+            n_agree     INTEGER,
+            n_disagree  INTEGER
+        );
+
+        -- If bot_trade_log already exists from before this change, run:
+        --   ALTER TABLE bot_trade_log ADD COLUMN IF NOT EXISTS conviction REAL;
+        -- Existing rows will have conviction=NULL (regime_conviction.py's
+        -- score wasn't captured before this fix) -- conviction_outcome_report()
+        -- filters those out automatically (it only scores trades with both
+        -- "conviction" and "won" keys present).
+
+        CREATE TABLE IF NOT EXISTS bot_symbol_state (
+            symbol         TEXT PRIMARY KEY,
+            reliability    REAL,
+            threshold      REAL,
+            step0_wins     INTEGER DEFAULT 0,
+            step0_total    INTEGER DEFAULT 0,
+            layer_weights  JSONB  DEFAULT '{}',
+            payout_history JSONB  DEFAULT '[]',
+            step0_recent_outcomes JSONB DEFAULT '[]',
+            updated_at     TIMESTAMPTZ DEFAULT now()
+        );
+
+        -- If bot_symbol_state already exists from before this change, run:
+        --   ALTER TABLE bot_symbol_state ADD COLUMN IF NOT EXISTS step0_recent_outcomes JSONB DEFAULT '[]';
+        -- Existing rows come back with step0_recent_outcomes=NULL, which
+        -- load_symbol_state() treats as "[]" (cold start for this window
+        -- only -- step0_wins/step0_total, used for the informational
+        -- heartbeat line, are unaffected).
+
+        CREATE TABLE IF NOT EXISTS bot_global_state (
+            key        TEXT PRIMARY KEY,
+            value      JSONB,
+            updated_at TIMESTAMPTZ DEFAULT now()
+        );
+
+        CREATE TABLE IF NOT EXISTS bot_gate_config (
+            key        TEXT PRIMARY KEY,
+            value      REAL,
+            updated_at TIMESTAMPTZ DEFAULT now()
+        );
+
+v7 — RISEFALL LSTM ENSEMBLE (Gate 6):
+    Read-only from here. Populated by the separate risefall_lstm_train.py
+    cron service(s) -- run this SQL once as well, before deploying either
+    service, if it doesn't already exist:
+
+        CREATE TABLE IF NOT EXISTS bot_risefall_lstm_model (
+            key             TEXT PRIMARY KEY,   -- "current_tick" / "current_minute"
+            kind            TEXT,
+            state_dict_b64  TEXT,
+            window_size     INTEGER,
+            hidden_size     INTEGER,
+            num_layers      INTEGER,
+            n_heads         INTEGER,
+            trained_at      TIMESTAMPTZ,
+            symbol          TEXT,
+            n_ticks_used    INTEGER,
+            n_train_examples INTEGER,
+            n_val_examples  INTEGER,
+            val_loss        REAL,
+            val_accuracy    REAL,
+            baseline_comparison JSONB,
+            updated_at      TIMESTAMPTZ DEFAULT now()
+        );
+
+    Optional env vars (all have working defaults):
+        LSTM_ENABLED               "true"/"false" -- kill switch for Gate 6
+        LSTM_MAX_UNCERTAINTY       default 0.18 -- ensemble p_std cap
+        LSTM_MIN_EDGE_STANDALONE   default 0.12 -- min edge for the LSTM
+                                    to originate a minute trade on its own
+                                    when the minute-native Gates 1-6
+                                    pipeline doesn't qualify a candidate
+        LSTM_RELOAD_INTERVAL_SECS  default 7200 -- how often to re-pull
+                                    state_dicts from Supabase (piggy-backed
+                                    onto run_calibration())
+
+    v10: this bot is MINUTES ONLY -- no tick contract path exists anymore.
+    If nothing qualifies with duration_unit="m" on a given cycle, it waits
+    rather than trading ticks as a fallback. See the "v10: minutes only"
+    section of README.md for the full writeup, including two real
+    duration-selection bugs found and fixed in the Monte Carlo layer
+    (monte_carlo_duration()/hmm_gbm_scan() were both mechanically biased
+    toward picking the longest candidate duration regardless of genuine
+    predictability -- verified empirically, not just by code review).
+
+    requires risefall_lstm_model.py (same file the trainer imports) to be
+    present alongside this script, and `torch` in requirements.txt.
+"""
+
+import asyncio
+import base64
+import io
+import json
+import os
+import random
+import sys
+import time
+import math
+import contextlib
+import warnings
+import numpy as np
+import requests
+import websockets
+from collections import deque, defaultdict
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Optional, Dict, List, Tuple
+
+from scipy.optimize import minimize
+from scipy.stats import rankdata, norm, ks_2samp
+from scipy.special import expit as sigmoid
+from statsmodels.tsa.ar_model import AutoReg
+from hmmlearn.hmm import GaussianHMM
+from arch import arch_model
+
+# RISEFALL LSTM ensemble (tick + minute-bar models) -- shared architecture
+# module, same one risefall_lstm_train.py trains against. See "LSTM MODEL
+# LOADING" section below for how the trained state_dicts are pulled from
+# Supabase and kept fresh, and Gate 6 in the main loop for how its output
+# is actually used.
+# LSTM ensemble removed (never beat chance in training). Kept only the
+# constants the rest of the pipeline reads.
+WINDOW_SIZE_TICKS = 200
+WINDOW_SIZE_MINUTES = 200
+CANDIDATE_DURATIONS_TICKS = [1, 3, 5, 7, 10]
+CANDIDATE_DURATIONS_MINUTES = [int(x) for x in os.getenv(
+    "CANDIDATE_DURATIONS_MINUTES", "1,2,3,5,10").split(",") if x.strip()]
+
+# PHILOSOPHY CHANGE (see regime_conviction.py for the full rationale):
+# regime-conditional layer routing + asymmetric conviction sizing.
+# This module must ship in the same folder as this file, exactly like
+# risefall_lstm_model.py does.
+from regime_conviction import (
+    regime_decision, conviction_outcome_report,
+    LAYER_NAMES as REGIME_LAYER_NAMES,
+)
+
+# Master switch. Set REGIME_ROUTING=false to fall back to the previous
+# ensemble-consensus behaviour without redeploying a different build.
+REGIME_ROUTING_ENABLED = os.getenv(
+    "REGIME_ROUTING", "true").strip().lower() not in ("0", "false", "no", "")
+
+# v15: minimal-filter mode. When on, a candidate needs (1) a direction from
+# fuse_signal(), (2) the MC expected-win-rate check (monte_carlo_duration +
+# MIN_EXP_WIN_RATE), and (3) Gates 2, 3, 5 (permutation entropy,
+# multi-timeframe confluence, advanced HMM/GBM borderline check) to qualify.
+# Gates 1, 4, 6 (layer agreement, bootstrap meta-ensemble, LSTM veto) are
+# skipped, in both try_minute_gates_candidate() and its recovery
+# counterpart. Gates 2/3/5 stay on by request -- each is self-contained
+# (price-series structure, or the cached HMM model + confidence/reliability
+# state) rather than requiring agreement across the layer/model stack, so
+# none of them depend on anything Gates 1/4/6 compute. This is a real
+# trade-off, not a bug fix: the three gates still skipped are what much of
+# this bot's development history (see the version notes at the top of this
+# file) spent effort tuning as quality filters. Turning them off trades
+# signal selectivity for trade volume. This does NOT touch regime routing
+# (REGIME_ROUTING env var above) -- that's a separate, orthogonal toggle,
+# since regime routing also drives conviction-based stake sizing and
+# martingale recovery arming (MARTINGALE_MIN_CONVICTION), not just
+# trade/no-trade eligibility. Off by default; set MINIMAL_FILTER_MODE=true
+# to enable.
+MINIMAL_FILTER_MODE = os.getenv(
+    "MINIMAL_FILTER_MODE", "false").strip().lower() in ("1", "true", "yes")
+
+REGIME_CFG = {
+    # Regime boundaries
+    "regime_hurst_trend":  float(os.getenv("REGIME_HURST_TREND",  "0.55")),
+    "regime_hurst_range":  float(os.getenv("REGIME_HURST_RANGE",  "0.45")),
+    "regime_vol_multiple": float(os.getenv("REGIME_VOL_MULTIPLE", "1.35")),
+    # Conviction sizing. Below the floor is NO trade, not a small one.
+    "conviction_floor":    float(os.getenv("CONVICTION_FLOOR",    "0.20")),
+    "conviction_min_mult": float(os.getenv("CONVICTION_MIN_MULT", "0.5")),
+    "conviction_max_mult": float(os.getenv("CONVICTION_MAX_MULT", "3.0")),
+    "conviction_min_voters": int(os.getenv("CONVICTION_MIN_VOTERS", "3")),
+    "conviction_max_stake": float(os.getenv("CONVICTION_MAX_STAKE", "0")),
+}
+
+# Conviction sizing may exceed the portfolio allocator's number, but not
+# without limit — the allocator's correlation/exposure penalties are the
+# only thing preventing several correlated symbols all firing large
+# simultaneously, and conviction has no cross-symbol view. This caps
+# conviction's override at N× whatever the allocator decided.
+CONVICTION_ALLOC_CEILING = float(os.getenv("CONVICTION_ALLOC_CEILING", "2.5"))
+
+# Forced-unlock grace period. A contract that has not settled by its own
+# duration plus this many seconds is polled directly once, then abandoned
+# and the symbol released. Prevents a dropped settlement message from
+# locking a symbol for the remaining life of the process.
+CONTRACT_SETTLE_GRACE_SECS = float(os.getenv("CONTRACT_SETTLE_GRACE_SECS", "60"))
+
+warnings.filterwarnings("ignore")
+
+# ---------------------------------------------------------------------------
+# CONFIG  (tune via your own walk-forward results before scaling up stakes)
+# ---------------------------------------------------------------------------
+DERIV_APP_ID = os.getenv("DERIV_APP_ID", "")
+DERIV_API_TOKEN = os.getenv("DERIV_API_TOKEN")
+DERIV_ACCOUNT_TYPE = os.getenv("DERIV_ACCOUNT_TYPE", "demo").strip().lower()
+DERIV_ACCOUNT_ID = os.getenv("DERIV_ACCOUNT_ID") or None
+# Comma-separated symbols to trade, e.g. "RDBULL,R_100,1HZ100V". Empty = the
+# original automatic universe (all R_ indices + top-3 1HZ).
+SYMBOLS_OVERRIDE = [x.strip() for x in os.getenv("SYMBOLS", "").split(",") if x.strip()]
+
+# ── Supabase persistence (Railway has no persistent filesystem) ──
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
+
+# ── Connection (new Deriv Options API) ──
+API_BASE = "https://api.derivws.com"
+ACCOUNTS_PATH = "/trading/v1/options/accounts"
+OTP_PATH = "/trading/v1/options/accounts/{account_id}/otp"
+
+MIN_STAKE = float(os.getenv("MIN_STAKE", "0.35"))
+# Every trade stakes exactly this much (overrides balance-% and conviction
+# sizing). Set FIXED_STAKE=0 to restore the original dynamic sizing.
+FIXED_STAKE = float(os.getenv("FIXED_STAKE", "0.35"))
+STAKE_PCT = 0.02                       # stake = max(MIN_STAKE, balance * STAKE_PCT)
+
+MARTINGALE_MAX_STEPS = int(os.getenv("MARTINGALE_MAX_STEPS", "0"))  # 0 = OFF (default). was 1               # Explicit instruction: activate on the FIRST loss,
+                                       # take exactly ONE recovery trade sized to recover
+                                       # it, then stop — win or lose, the sequence is over
+                                       # after that single next trade. No further cascade.
+                                       # Stake for that trade is computed by
+                                       # recovery_stake_for_loss() from the symbol's real
+                                       # payout ratio, not a fixed multiplier — see there.
+
+MARTINGALE_MIN_CONVICTION = float(os.getenv("MARTINGALE_MIN_CONVICTION", "0.50"))
+# Explicit instruction: martingale only arms after a loss on a HIGH-
+# conviction trade — not any loss. Conviction is regime_conviction.py's
+# compute_conviction() score in [0, 1]; the regime module already refuses
+# to trade at all below its own conviction_floor (0.20 by default), so this
+# is a second, higher bar specifically for "is this loss worth recovering
+# aggressively." A trade with no conviction score at all (regime routing
+# was disabled, or it came from the lstm_standalone path, which doesn't
+# produce one) never arms recovery — there's nothing to gate on, so the
+# conservative default is to skip it, not assume it qualifies.
+
+MARTINGALE_MAX_STAKE_PCT = float(os.getenv("MARTINGALE_MAX_STAKE_PCT", "0.05"))
+# Explicit instruction: once conviction qualifies, martingale always arms —
+# it no longer refuses to arm just because the full-recovery stake would be
+# large relative to balance (see MAX_SEQUENCE_LOSS_PCT note below). Instead
+# the STAKE ITSELF is clamped to this fraction of current balance. A
+# clamped trade may not fully recover the loss even if it wins — that's the
+# accepted tradeoff for "always arms on a qualifying loss."
+
+# FIX v2: Hard cap on total stake committed in one martingale sequence.
+# If the cumulative at-risk amount would exceed this fraction of balance,
+# abort the recovery rather than place the next step.
+# This would have prevented the account destruction: the bot kept recovering
+# at growing stakes while balance fell, compounding losses.
+# NOTE: explicit instruction changed how this applies to the FIRST recovery
+# step (see the `else:` branch after a loss, below) — that step no longer
+# aborts arming over this limit, it clamps the stake to
+# MARTINGALE_MAX_STAKE_PCT instead. This constant is still used as-is (abort,
+# not clamp) on the second-step continuation path, which is currently dead
+# while MARTINGALE_MAX_STEPS == 1.
+MAX_SEQUENCE_LOSS_PCT = 0.05           # Never risk more than 5% of balance in one sequence
+
+SCHEDULED_CALIBRATION_INTERVAL = 2 * 60 * 60   # seconds — full deep recal every 2 hours
+CALIBRATION_COOLDOWN = 5 * 60                  # grace period after calibration ends
+HISTORY_BOOTSTRAP_COUNT = 10000                # ticks fetched per symbol at startup
+
+CONFIDENCE_THRESHOLD_DEFAULT = 0.11    # fallback only — real threshold set adaptively
+                                        # (see ADAPTIVE_THRESHOLD_PERCENTILE below)
+
+# ── Quality gates ──────────────────────────────────────────────────────────
+MIN_SCORE_GAP = 0.05
+
+# FIX v3: GATE_SCHEMA_VERSION bumped 2 → 3.
+# v3 introduces portfolio allocation and drift-event-driven recalibration,
+# which change the semantics of the gate stack meaningfully enough that
+# v2 autotune-settled values (e.g. min_layer_agree pushed back to 11)
+# should not carry over. Bumping forces load_gates() to detect the version
+# mismatch, discard the stale rows, and use the new code defaults (9/4).
+#
+# v15 BUGFIX: bumped 4 -> 5. Same failure class as the 2026-07-29 incident
+# documented below (GATE_SCHEMA_VERSION_BUMP_NOTE), this time via
+# MIN_EXP_WIN_RATE instead of MIN_LAYER_AGREE: autotune_gates() tightened it
+# to its 0.58 ceiling off a historically bad win rate, and its own RELAX
+# branch (needs total_trades >= 100) could never re-fire because a 0.58 bar
+# blocks almost everything -- confirmed in production logs, where
+# [AutoTune] printed the IDENTICAL "WR=0.282 over 475 trades" on every one
+# of 4 separate calibration cycles across a full hour, meaning zero new
+# step-0 trades resolved that whole session. The step0_recent_outcomes
+# rolling-window fix (see TradeState) prevents this from recurring, but
+# does not by itself un-stick the value already persisted in Supabase from
+# before that fix existed -- this version bump is what actually clears it,
+# the same way it did for the 2026-07-29 incident.
+GATE_SCHEMA_VERSION = 5
+
+# ── Layer agreement gate ──────────────────────────────────────────────────
+# FIX v3: Lowered 12/3 → 9/4 based on actual demo log analysis (2026-06-30).
+# Of 150 rejected signals: 0 reached 11, but 26 hit exactly 10 and 31 hit
+# exactly 9 — the distribution clustered just below the bar, not far below
+# it. At 12/3 only 2 trade sequences completed in 3.7 hours, leaving almost
+# nothing for the new entropy/confluence/bootstrap gates to evaluate (they
+# rejected only 12 signals combined vs. 150 from this gate alone). Lowering
+# to 9/4 (56% supermajority, was 75%) should let ~38% of candidates through
+# to the new gates, which are now responsible for doing the real selection
+# work instead of mostly sitting idle downstream of an already-empty funnel.
+# NOTE: lowering this gate alone does not by itself raise trade quality —
+# it shifts more of the filtering burden onto entropy/confluence/bootstrap.
+# Watch their rejection rates after this change; if they stay near-idle while
+# win rate degrades, the new gates need tightening, not this one loosening further.
+MIN_LAYER_AGREE    = int(os.getenv("MIN_LAYER_AGREE", "9"))
+MAX_LAYER_DISAGREE = int(os.getenv("MAX_LAYER_DISAGREE", "4"))
+
+# ── Adaptive gate controller (v5) ───────────────────────────────────────────
+# Root cause of the 2026-07-29 near-zero-trade-frequency incident: MIN_LAYER_
+# AGREE was found live at 12 (75% supermajority of 16 layers) via a stuck
+# Supabase-persisted value from a PREVIOUS autotune_gates() tightening run --
+# the exact failure mode already described in the save_gates() comment below
+# ("logs showed need >=11 agree even though v2.py hardcodes 12"). Real votes
+# over a 2-hour, 8-symbol log NEVER once reached 12 (max observed: 11/16 =
+# 68.75%) -- so the gate was mathematically guaranteed to block every trade,
+# forever, on every symbol. autotune_gates() could not self-correct because
+# its RELAX branch only runs after 50 COMPLETED step-0 trades -- which can
+# never accumulate once the gate is blocking 100% of attempts. A one-time
+# default change (this has already happened once, see the comment above
+# lowering 12->9) just gets undone by the next tightening streak. Fixing
+# this for real needs a mechanism that can't deadlock -- see
+# maybe_recalibrate_gate() below, which recalibrates from the CYCLE-level
+# vote distribution (always available, even with zero completed trades),
+# not from completed-trade win rate (autotune_gates() keeps that role as a
+# secondary quality control, not the only lever).
+GATE_SCHEMA_VERSION_BUMP_NOTE = (
+    "GATE_SCHEMA_VERSION bumped 3->4 below to force a clean reset of "
+    "whatever value is currently stuck in bot_gate_config."
+)
+GATE_ABS_FLOOR_AGREE    = 4     # never recalibrate below this (safety: some
+                                 # minimum consensus must still be required)
+GATE_ABS_CEIL_AGREE     = 14    # never recalibrate above this
+GATE_ABS_FLOOR_DISAGREE = 1
+GATE_ABS_CEIL_DISAGREE  = 8
+GATE_TARGET_PASS_RATE   = 0.12  # aim for ~12% of gate CHECKS (not trades) to
+                                 # clear Gate 1 -- the knob to turn if you
+                                 # want more/less trade frequency long-term
+# v15 BUGFIX: bounded rolling window (in step-0 trades, summed across all
+# symbols) that autotune_gates() uses for its win-rate decision, replacing
+# the old unbounded lifetime cumulative. See TradeState.step0_recent_outcomes
+# for the full rationale. 150 gives autotune_gates' existing
+# `total_trades >= 100` relax-check room to fire off real recent data
+# instead of being permanently starved by ancient history.
+STEP0_ROLLING_WINDOW = 150
+GATE_RECALIB_MIN_SAMPLES = 150  # need this many pooled (agree,disagree)
+                                 # samples before trusting a percentile read
+GATE_RECALIB_INTERVAL_SECS = 900   # 15 min between routine recalibrations
+GATE_STARVATION_SECS       = 1800  # 30 min with zero executed trades (across
+                                    # ALL symbols) force-triggers an emergency
+                                    # loosen regardless of the interval above
+                                    # -- this is the deadlock-breaker: it does
+                                    # not require any completed trade to fire.
+GATE_VOTE_WINDOW = 1000  # rolling pooled-vote sample size the percentile
+                          # recalibration reads from
+
+# ── v6: confidence-gated advanced-MC agreement ──────────────────────────
+# Middle ground between v4 (hard AND-gate on every trade -- discarded ~half
+# of good signals for disagreeing with what's close to a coin flip, per
+# this file's own documented ~0.50-0.51 finding) and v5 (fully diagnostic --
+# no real second opinion at all). v6: only REQUIRE hmm_gbm_scan() agreement
+# when the layer stack's own signal is borderline (score sitting close to
+# its qualifying threshold); a signal that clears its threshold by a wide
+# margin fires regardless, since a coin-flip-ish MC read has nothing useful
+# to add to an already-strong signal. Applies the requirement only where
+# a second opinion might plausibly change the right call.
+MC_BORDERLINE_MULTIPLIER = 1.5   # score < 1.5x its threshold = borderline
+
+# ── Monte Carlo quality floor ─────────────────────────────────────────────
+# FIX v2: Lowered from 0.52 → 0.505. The MC was blocking 186 signals because
+# genuine random-walk synthetics only produce ~0.50-0.51 from simulation.
+# The real edge comes from the layer stack, not the MC simulation alone.
+# 0.505 filters out clearly negative-edge scenarios while allowing the
+# layer-quality gate to do the primary selection work.
+MIN_EXP_WIN_RATE = float(os.getenv("MIN_EXP_WIN_RATE", "0.505"))
+
+# ── Adaptive threshold percentile ─────────────────────────────────────────
+ADAPTIVE_THRESHOLD_PERCENTILE = 75
+
+# ── Post-loss deep recalibration ──────────────────────────────────────────
+# FIX v2: Disabled POST_LOSS_DEEP_RECAL.
+# Every loss was triggering a 688-second full recalibration, meaning the bot
+# spent 11.5 minutes locked after EVERY single lost trade. At 41% loss rate
+# that's ~28 minutes of downtime per hour. Also the deep recal was supposed
+# to improve models but the broken Hurst meant it was calibrating on corrupted
+# features. Use scheduled 2-hour recal only — sufficient for synthetics.
+POST_LOSS_DEEP_RECAL = False
+CANDIDATE_DURATIONS = [1, 3, 5, 7, 10]
+
+# FIX v2: Reduced MC_SIMULATIONS from 50000 → 8000.
+# The calibration wall time was 688 seconds (11.5 min) for 8 symbols.
+# MC is used to select the best duration among 5 candidates on random-walk
+# synthetics where the true win rate is ~0.50 ± 0.02. 8000 paths gives a
+# standard error of sqrt(0.5*0.5/8000) = 0.0056 — more than sufficient to
+# distinguish 0.52 from 0.51 with high confidence. This reduces calibration
+# time by ~80% while retaining statistical validity.
+MC_SIMULATIONS = 8000
+
+WATCHDOG_TIMEOUT = 5 * 60
+WATCHDOG_CHECK_INTERVAL = 20
+
+MIN_TICKS_FOR_FIT = 200
+MIN_TICKS_LIVE = 60
+
+# ── v3: Event-driven recalibration — replaces fixed 2-hour timer ──────────
+# Recalibration fires when ANY drift detector exceeds its threshold.
+# SCHEDULED_CALIBRATION_INTERVAL is now a maximum backstop, not a trigger.
+SCHEDULED_CALIBRATION_INTERVAL = 6 * 60 * 60   # 6-hour absolute backstop
+CALIBRATION_COOLDOWN = 5 * 60
+
+# ── v3: Drift detection thresholds ────────────────────────────────────────
+# KS test: p-value threshold below which return distribution is flagged as
+# shifted. ks_2samp(train_returns, live_returns).pvalue < KS_P_THRESHOLD.
+KS_P_THRESHOLD        = 0.05
+
+# PSI: Population Stability Index for confidence scores.
+# PSI < 0.1 = stable, 0.1-0.25 = slight shift, > 0.25 = major shift.
+PSI_THRESHOLD         = 0.20
+
+# CUSUM: sequential win-rate degradation. Fires when cumulative sum of
+# (0.5 - outcome) exceeds threshold, indicating sustained below-50% performance.
+CUSUM_THRESHOLD       = 4.0
+CUSUM_DRIFT           = 0.03   # expected drift to detect (sensitivity)
+
+# v15 BUGFIX: how many consecutive KS/PSI fires (checked ~every few seconds
+# per symbol) are required before drift_degraded actually latches. Before
+# this, a single momentary fire locked the symbol until the NEXT full
+# recalibration (10-20+ min), with no way for a one-off blip to clear
+# itself in between. Over a multi-minute unlocked window with continuous
+# per-symbol checking, that made it near-certain every symbol would
+# eventually latch at least once, which is why production logs showed
+# every recalibration triggering on all 8 symbols simultaneously. Requiring
+# a short streak means genuine, persistent drift still catches quickly,
+# but an isolated noisy read no longer costs the rest of the run.
+DRIFT_CONSECUTIVE_REQUIRED = 3
+
+# Stake multiplier applied immediately on drift detection, before recal completes.
+# Protects capital during model degradation window.
+DRIFT_STAKE_REDUCTION = 0.50   # 50% of normal stake during degraded regime
+
+# ── v3: Meta-learner settings ─────────────────────────────────────────────
+META_MIN_SAMPLES      = 200    # minimum resolved trades before meta-learner activates
+META_LEARNING_RATE    = 0.10   # logistic regression online update rate
+META_L2               = 0.01   # L2 regularisation weight
+
+# ── v3: Portfolio allocation settings ─────────────────────────────────────
+PORTFOLIO_MAX_CONCURRENT   = 3      # max simultaneous open positions
+PORTFOLIO_MAX_TOTAL_RISK   = 0.06   # max 6% of balance at risk across all open positions
+PORTFOLIO_CORR_WINDOW      = 500    # ticks of returns used for correlation estimation
+PORTFOLIO_HIGH_CORR        = 0.40   # above this → correlation penalty applies
+
+# ── v7: RISEFALL LSTM ensemble (Gate 6) ────────────────────────────────────
+# Two independently-trained deep-ensemble models (risefall_lstm_train.py,
+# MODEL_KIND=tick / MODEL_KIND=minute), loaded here from Supabase. Unlike
+# Gate 5's hmm_gbm_scan() (confidence-gated -- only vetoes borderline
+# signals), Gate 6 is a HARD veto: any trade this bot is about to place
+# gets skipped if the LSTM ensemble disagrees on direction, full stop, not
+# just on borderline ones. This model IS what the trainer optimizes and
+# uploads every cron cycle -- it's the served signal, not a diagnostic --
+# so it gets real, unconditional veto power. (The five comparison
+# baselines run_baseline_diagnostics() fits in risefall_lstm_train.py --
+# persistence, AR(1)/Hurst, GBM, a GRU, a dilated CNN -- are the ones that
+# stay diagnostic-only; they exist purely to sanity-check that THIS model
+# is worth serving, and never touch a live trade themselves.)
+#
+# v10: MINUTES ONLY. There is no tick contract path left in this bot at
+# all -- see the "v10: minutes only" section of the README for the full
+# writeup. If nothing qualifies with duration_unit="m" this cycle
+# (minute-native Gates 1-6 pipeline, then the standalone LSTM path as a
+# second opinion), the bot waits. It never substitutes a tick trade,
+# including if Deriv rejects a minute-duration buy request -- that fails
+# the trade attempt cleanly instead.
+LSTM_ENABLED = False   # LSTM removed from this build
+LSTM_MAX_UNCERTAINTY     = float(os.getenv("LSTM_MAX_UNCERTAINTY", "0.18"))
+# Minimum |p-0.5| edge for the LSTM ensemble to originate a trade entirely
+# on its own, when the minute-native Gates 1-6 pipeline doesn't qualify a
+# candidate for a symbol this cycle. Only ever considers the ensemble's
+# own MINUTE-duration pick -- a tick-duration LSTM read is simply not a
+# qualifying candidate anymore, not a fallback.
+LSTM_MIN_EDGE_STANDALONE = float(os.getenv("LSTM_MIN_EDGE_STANDALONE", "0.12"))
+# How often (seconds) to re-pull the latest state_dicts from Supabase.
+# Reload is piggy-backed onto run_calibration() (already periodic / event-
+# driven) rather than a separate timer, so it never races a trade in
+# flight. Defaults to the trainer's own cadence (2h).
+LSTM_RELOAD_INTERVAL_SECS = float(os.getenv("LSTM_RELOAD_INTERVAL_SECS", str(2 * 60 * 60)))
+LSTM_MIN_TICK_RETURNS_FOR_SIGNAL   = 30
+LSTM_MIN_MINUTE_RETURNS_FOR_SIGNAL = 30
+
+
+# ---------------------------------------------------------------------------
+# SUPABASE PERSISTENCE STORE
+# Railway's filesystem is ephemeral — every restart wipes in-memory state.
+# SupabaseStore is the single exit point for all learned state: layer weights,
+# per-symbol thresholds, reliability scores, win counts, and trade history.
+# All methods are synchronous (requests) so they run during calibration pauses.
+# Failures are always swallowed — the bot degrades to in-memory-only if down.
+# ---------------------------------------------------------------------------
+class SupabaseStore:
+    def __init__(self):
+        self.url = SUPABASE_URL
+        self.key = SUPABASE_KEY
+        self.ok  = bool(self.url and self.key)
+        if self.ok:
+            print(f"[Store] Supabase persistence active → {self.url}")
+        else:
+            print("[Store] SUPABASE_URL / SUPABASE_KEY not set — "
+                  "learned state will NOT persist across Railway restarts.")
+
+    def _headers(self, prefer="return=minimal"):
+        return {"apikey": self.key, "Authorization": f"Bearer {self.key}",
+                "Content-Type": "application/json", "Prefer": prefer}
+
+    def _upsert(self, table, payload):
+        if not self.ok: return
+        try:
+            r = requests.post(f"{self.url}/rest/v1/{table}",
+                              headers=self._headers("resolution=merge-duplicates,return=minimal"),
+                              json=payload, timeout=10)
+            if r.status_code not in (200, 201, 204):
+                print(f"[Store] {table} upsert {r.status_code}: {r.text[:160]}")
+        except Exception as e:
+            print(f"[Store] {table} upsert failed: {e}")
+
+    def _insert(self, table, payload):
+        if not self.ok: return
+        try:
+            r = requests.post(f"{self.url}/rest/v1/{table}",
+                              headers=self._headers(), json=payload, timeout=10)
+            if r.status_code not in (200, 201, 204):
+                print(f"[Store] {table} insert {r.status_code}: {r.text[:160]}")
+        except Exception as e:
+            print(f"[Store] {table} insert failed: {e}")
+
+    def _select(self, table, query="select=*"):
+        if not self.ok: return []
+        try:
+            r = requests.get(f"{self.url}/rest/v1/{table}?{query}",
+                             headers=self._headers("return=representation"), timeout=12)
+            if r.status_code == 200: return r.json()
+            print(f"[Store] {table} select {r.status_code}: {r.text[:160]}")
+        except Exception as e:
+            print(f"[Store] {table} select failed: {e}")
+        return []
+
+    def fetch_scored_trades(self, limit=500):
+        """Recent completed trades that carry both conviction and won --
+        exactly what conviction_outcome_report() needs. Trades logged
+        before the conviction column existed come back with conviction=NULL
+        and are filtered out by the caller, same as the report already does
+        for any trade missing either field."""
+        rows = self._select(
+            "bot_trade_log",
+            f"select=conviction,won&conviction=not.is.null&order=ts.desc&limit={limit}"
+        )
+        return [{"conviction": r["conviction"], "won": r["won"]} for r in rows]
+
+    def save_trade(self, symbol, direction, step, stake, won, profit,
+                   p_up, confidence, duration, feats, conviction=None):
+        votes = {}
+        if feats:
+            votes = {
+                "markov":    round((feats.get("markov_p",     0.5) - 0.5) * 2, 4),
+                "hmm":       round(feats.get("hmm_lean",      0), 4),
+                "hawkes":    round(feats.get("hawkes",         0), 4),
+                "ou":        round(feats.get("ou_dir",         0) * feats.get("ou_strength", 0), 4),
+                "hurst":     round(feats.get("hurst_signal",   0), 4),
+                "arfima":    round(feats.get("arfima_bias",    0), 4),
+                "kalman":    round(feats.get("kalman",         0), 4),
+                "copula":    round((feats.get("copula_agree", 0.5) - 0.5) * 2, 4),
+                "rsi":       round(feats.get("rsi_signal",     0), 4),
+                "srsi":      round(feats.get("srsi_signal",    0), 4),
+                "adx":       round(feats.get("adx_dir",        0) * feats.get("adx_trend", 0), 4),
+                "boll":      round(feats.get("boll_signal",    0), 4),
+                "zscore":    round(feats.get("z_signal",       0), 4),
+                "te":        round(feats.get("te_signal",      0), 4),
+                "jump":      round(feats.get("jump_dir",       0) * feats.get("jump_intensity", 0), 4),
+                "post_jump": round(feats.get("post_jump",      0) * feats.get("jump_intensity", 0), 4),
+                "momentum_mode": int(feats.get("momentum_mode", False)),
+            }
+        self._insert("bot_trade_log", {
+            "ts": datetime.utcnow().isoformat(), "symbol": symbol,
+            "direction": int(direction), "step": int(step),
+            "stake": round(float(stake), 4), "won": bool(won),
+            "profit": round(float(profit), 4), "p_up": round(float(p_up), 6),
+            "confidence": round(float(confidence), 6), "duration": int(duration),
+            # BUGFIX: regime_conviction.py's conviction score was computed
+            # every cycle (regime_res["conviction"]) but silently dropped
+            # before it reached the trade log -- only the unrelated ensemble
+            # `confidence` was persisted. That made conviction_outcome_report()
+            # (this module's own tool for checking whether the conviction
+            # floor and sizing are actually working) impossible to run: it
+            # needs a "conviction" field on completed trades and none were
+            # ever recorded. None when regime routing didn't produce a score
+            # for this trade (e.g. REGIME_ROUTING disabled, or a non-regime
+            # source picked the candidate).
+            "conviction": round(float(conviction), 6) if conviction is not None else None,
+            "layer_votes": json.dumps(votes),
+            "n_agree":    int(feats.get("agree_up",    0)) if feats else 0,
+            "n_disagree": int(feats.get("disagree_up", 0)) if feats else 0,
+        })
+
+    def save_symbol_state(self, state):
+        for s, m in state.model_cache.items():
+            self._upsert("bot_symbol_state", {
+                "symbol":         s,
+                "reliability":    round(float(state.reliability.get(s, 1.0)), 6),
+                "threshold":      round(float(state.per_symbol_threshold.get(s, state.adaptive_threshold)), 6),
+                "step0_wins":     int(state.step0_wins.get(s, 0)),
+                "step0_total":    int(state.step0_total.get(s, 0)),
+                "layer_weights":  json.dumps(m.per_layer_weights or {}),
+                # FIX v2: persist the rolling Kelly payout history per symbol
+                # so quarter-Kelly sizing doesn't reset to the conservative
+                # default on every Railway restart/redeploy.
+                "payout_history": json.dumps(state.payout_history.get(s, [])[-50:]),
+                # v15: persist the bounded rolling step-0 outcome window
+                # (see TradeState.step0_recent_outcomes) so autotune_gates()
+                # keeps judging recent performance across restarts instead
+                # of silently falling back to an empty window and needing
+                # 50 fresh trades to re-earn an opinion.
+                "step0_recent_outcomes": json.dumps(
+                    list(state.step0_recent_outcomes.get(s, []))),
+                "updated_at":     datetime.utcnow().isoformat(),
+            })
+        print(f"[Store] Saved state for {len(state.model_cache)} symbols to Supabase.")
+
+    def load_symbol_state(self, state):
+        rows = self._select("bot_symbol_state")
+        if not rows:
+            print("[Store] No prior symbol state found — cold start.")
+            return
+        if not hasattr(state, '_pending_weights'):
+            state._pending_weights = {}
+        for row in rows:
+            s = row["symbol"]
+            state.reliability[s]          = float(row.get("reliability", 1.0))
+            state.per_symbol_threshold[s] = float(row.get("threshold",   state.adaptive_threshold))
+            state.step0_wins[s]           = int(row.get("step0_wins",   0))
+            state.step0_total[s]          = int(row.get("step0_total",  0))
+            raw_w = row.get("layer_weights") or "{}"
+            weights = json.loads(raw_w) if isinstance(raw_w, str) else (raw_w or {})
+            if weights:
+                state._pending_weights[s] = weights
+            # FIX v2: restore Kelly payout history
+            raw_p = row.get("payout_history") or "[]"
+            payouts = json.loads(raw_p) if isinstance(raw_p, str) else (raw_p or [])
+            if payouts:
+                state.payout_history[s] = payouts
+            # v15: restore rolling step-0 outcome window. Missing column
+            # (pre-migration rows) falls back to "[]" -- same cold-start
+            # behavior as a brand new symbol, not an error.
+            raw_o = row.get("step0_recent_outcomes") or "[]"
+            outcomes = json.loads(raw_o) if isinstance(raw_o, str) else (raw_o or [])
+            if outcomes:
+                state.step0_recent_outcomes[s].extend(outcomes[-STEP0_ROLLING_WINDOW:])
+        print(f"[Store] Warm-started state for {len(rows)} symbols from Supabase.")
+
+
+    def save_global_state(self, state):
+        """Persist global (non-per-symbol) self-improvement state.
+        FIX v3: also persist balance peak for drawdown tracking.
+        Previously only saved after trade closes — with only 3 trades in the
+        session, direction_history only had 3 entries in Supabase. Now called
+        periodically by the heartbeat so the window stays warm across restarts."""
+        hist = list(state.direction_history)[-30:]
+        self._upsert("bot_global_state", {
+            "key":        "direction_history",
+            "value":      json.dumps(hist),
+            "updated_at": datetime.utcnow().isoformat(),
+        })
+
+    def load_global_state(self, state):
+        rows = self._select("bot_global_state", "select=key,value")
+        for row in rows:
+            if row["key"] == "direction_history":
+                raw = row.get("value") or "[]"
+                # Supabase may return JSONB as already-parsed list or as string
+                if isinstance(raw, str):
+                    try:
+                        hist = json.loads(raw)
+                    except Exception:
+                        hist = []
+                elif isinstance(raw, list):
+                    hist = raw
+                else:
+                    hist = []
+                # Ensure all entries are plain Python ints
+                hist = [int(d) for d in hist if d in (1, -1)]
+                if hist:
+                    state.direction_history = hist[-30:]
+                    print(f"[Store] Restored direction_history "
+                          f"({len(state.direction_history)} entries, "
+                          f"call_ratio={sum(1 for d in hist if d==1)/len(hist):.0%}).")
+
+    # FIX v2: Schema version stamp on saved gates.
+    # Without this, a gate row saved by an OLDER bot version (e.g. the
+    # original pre-multi-gate-stack bot) silently overrides the new
+    # hardcoded defaults on every restart via load_gates() below — exactly
+    # what happened after the v2 deploy: logs showed "need >=11 agree" even
+    # though v2.py hardcodes MIN_LAYER_AGREE=12, because the stale value from
+    # a previous run's autotune_gates() was still sitting in bot_gate_config.
+    # Bump GATE_SCHEMA_VERSION any time the gate stack's semantics change
+    # (e.g. adding/removing a sequential filter) to force a clean reset.
+    def save_gates(self, min_agree, max_disagree, min_exp_wr, adaptive_thr):
+        for key, val in [("min_layer_agree",    float(min_agree)),
+                         ("max_layer_disagree", float(max_disagree)),
+                         ("min_exp_win_rate",   float(min_exp_wr)),
+                         ("adaptive_threshold", float(adaptive_thr)),
+                         ("gate_schema_version", float(GATE_SCHEMA_VERSION))]:
+            self._upsert("bot_gate_config", {"key": key, "value": round(val, 6),
+                                              "updated_at": datetime.utcnow().isoformat()})
+
+    def load_gates(self):
+        rows = self._select("bot_gate_config", "select=key,value")
+        gates = {row["key"]: float(row["value"]) for row in rows}
+        saved_version = gates.get("gate_schema_version", -1)
+        if saved_version != GATE_SCHEMA_VERSION:
+            print(f"[Store] Gate config schema mismatch "
+                  f"(saved={saved_version}, current={GATE_SCHEMA_VERSION}) — "
+                  f"ignoring stale persisted gates, using code defaults.")
+            return {}
+        return gates
+
+
+# Module-level store singleton — instantiated once in main()
+_store: Optional[SupabaseStore] = None
+
+
+# ---------------------------------------------------------------------------
+# SHARED STATE  (single source of truth - every module reads/writes through this)
+# ---------------------------------------------------------------------------
+class TradeState:
+    def __init__(self):
+        self.balance = 0.0
+        self.trading_locked = False
+        # v11: was a single bool, correct only when trades fired one at a
+        # time. Portfolio allocations now fire concurrently (see the
+        # execution loop), so multiple execute_single_step() calls can be
+        # in flight together -- a bool set False by whichever one finishes
+        # first would go "in progress: false" while others are still open.
+        # A count of in-flight trades is correct regardless of how many
+        # overlap. trade_in_progress below is a read-only view over it so
+        # every existing call site (`if state.trading_locked or
+        # state.trade_in_progress:`) keeps working unchanged.
+        self.trades_in_flight = 0
+        self.consecutive_losses = defaultdict(int)
+        self.reliability = defaultdict(lambda: 1.0)
+        self.loss_triggered_calibrations_24h = deque()
+        self.last_scheduled_calibration = time.time()
+        self.last_calibration_end = 0.0
+        self.model_cache: Dict[str, "SymbolModels"] = {}
+        # v9: minute-bar-fit models (HMM/GARCH/OU/Hawkes), parallel to
+        # model_cache above but fit on MinuteBarView data instead of raw
+        # ticks -- see fit_minute_models_for_symbol(). Absent entries just
+        # mean "no minute model yet for this symbol" (insufficient minute
+        # bars, or calibration hasn't reached it this cycle); every
+        # minute-native call site treats that as a clean fallback to the
+        # tick path, never a crash.
+        self.minute_model_cache: Dict[str, "SymbolModels"] = {}
+        self.last_activity = time.time()
+
+        # Threshold: per-symbol, derived from each symbol's own OOS confidence
+        # distribution during deep calibration. Falls back to global default
+        # only for symbols not yet calibrated.
+        self.adaptive_threshold = CONFIDENCE_THRESHOLD_DEFAULT   # global fallback
+        self.per_symbol_threshold: Dict[str, float] = {}
+
+        # Martingale recovery context — saved between main-loop iterations so
+        # each recovery step waits for a genuine signal, not an instant re-entry
+        # Recovery state — NO symbol/direction lock on WHICH symbol executes
+        # a recovery trade (see the recovery scan below: it searches every
+        # ready symbol for the best current signal, same as before). What IS
+        # per-symbol is the recovery OBLIGATION itself, keyed by the symbol
+        # whose step-0 loss armed it -- so two symbols losing in the same
+        # cycle each get their own independent recovery slot instead of one
+        # clobbering the other's step/stake (v12; was a single shared slot).
+        # symbol -> {"step": int, "stake": float, "committed": float}
+        self.recovery: Dict[str, dict] = {}
+
+        # FIX v2: Track stake committed so far in the current martingale
+        # sequence. Per-symbol now too -- see "committed" in each recovery
+        # entry above. (Kept as its own comment since MAX_SEQUENCE_LOSS_PCT
+        # still reads it from there.)
+
+        # FIX v2: Direction balance tracking.
+        # A rolling window of the last 30 trade directions (+1=CALL, -1=PUT).
+        # Used to compute recent_call_ratio, which bayesian_fusion uses to
+        # apply a soft correction when the model is one-sided.
+        self.direction_history: list = []  # deque-style, max 30 entries
+
+        # FIX v2: Rolling payout ratio tracking (per symbol) for Kelly sizing.
+        # Deriv Rise/Fall payout varies by symbol/duration/volatility regime,
+        # so it must be measured empirically rather than assumed. Stores the
+        # last 50 winning trades' (profit / stake) ratio per symbol.
+        self.payout_history: Dict[str, list] = defaultdict(list)
+
+        # Step-0 (raw signal, no martingale recovery) win-rate tracking —
+        # the only metric that honestly reveals whether the signal has edge.
+        # step0_wins/step0_total are LIFETIME cumulative (kept for the
+        # informational s0_wr= heartbeat line and for backward-compat with
+        # existing Supabase rows) -- they are NOT used for gate decisions
+        # any more, see step0_recent_outcomes below.
+        self.step0_wins   = defaultdict(int)
+        self.step0_total  = defaultdict(int)
+        # v15 BUGFIX: autotune_gates() used to compute win rate from the
+        # LIFETIME cumulative step0_wins/step0_total above -- with no decay
+        # and no reset, a historically bad stretch (e.g. trades from before
+        # earlier bugs in this file were fixed) permanently pins the win
+        # rate below the 0.46 tightening threshold, which then locks
+        # MIN_EXP_WIN_RATE at its 0.58 ceiling. Since so few trades pass a
+        # 0.58 bar, the denominator barely grows, so the stale number can
+        # never be diluted -- a self-sustaining lockout confirmed in
+        # production (WR=0.282 over 475 trades, printed identically across
+        # 4 separate calibration cycles in one session, meaning zero new
+        # step-0 trades resolved the entire hour). A bounded rolling window
+        # per symbol means old performance actually ages out once enough
+        # NEW trades occur, so an improved bot can dig itself out instead
+        # of being permanently judged by trades that predate the fixes.
+        self.step0_recent_outcomes: Dict[str, deque] = defaultdict(
+            lambda: deque(maxlen=STEP0_ROLLING_WINDOW))
+
+        # Self-improvement bookkeeping
+        self._pending_weights: Dict[str, dict] = {}
+        self._trades_since_autotune = 0
+
+        # ── v5: Adaptive gate controller state ──────────────────────────
+        # Pooled (agree, disagree, total_layers) samples from EVERY Gate-1
+        # check (pass or fail), across all symbols. Populated on every
+        # passes_layer_gate() call in the main scan loops -- unlike trade
+        # outcomes, this is available even when the gate is blocking 100%
+        # of attempts, which is what makes it deadlock-proof.
+        self.recent_gate_votes = deque(maxlen=GATE_VOTE_WINDOW)
+        self.last_gate_recalib_time = time.time()
+        # Updated on every ACTUAL trade execution (execute_single_step).
+        # Starting it at process-start time (not 0) means a fresh deploy
+        # gets one full GATE_STARVATION_SECS grace period before the
+        # emergency breaker can fire, rather than firing immediately.
+        self.last_trade_time = time.time()
+
+        # ── v3: Drift detection state ─────────────────────────────────────
+        # Per-symbol training return window (snapshot at calibration time)
+        # used as the reference distribution for KS and PSI tests.
+        self.drift_reference_returns: Dict[str, np.ndarray] = {}
+        # Per-symbol confidence score history for PSI
+        self.drift_confidence_history: Dict[str, deque] = defaultdict(lambda: deque(maxlen=200))
+        # Per-symbol CUSUM accumulators
+        self.cusum_stat: Dict[str, float] = defaultdict(float)
+        # Whether a symbol is currently in a degraded-model state
+        self.drift_degraded: Dict[str, bool] = defaultdict(bool)
+        # v15 BUGFIX: consecutive-fire counter for KS/PSI, so a single noisy
+        # blip can't latch drift_degraded on its own -- see check_all()'s
+        # comment for the full rationale.
+        self.drift_consecutive_fires: Dict[str, int] = defaultdict(int)
+        # Last drift check timestamp per symbol
+        self.last_drift_check: Dict[str, float] = defaultdict(float)
+
+        # ── v3: Meta-learner state ────────────────────────────────────────
+        # Per-symbol logistic regression weights over the 16 layer outputs.
+        # None = not enough data yet, falls back to Bayesian fusion.
+        self.meta_weights: Dict[str, np.ndarray] = {}
+        self.meta_bias:    Dict[str, float]       = {}
+        # Ring buffer of (layer_vector, outcome) training examples per symbol
+        self.meta_buffer:  Dict[str, deque] = defaultdict(lambda: deque(maxlen=2000))
+
+        # ── v3: Confidence calibration state ─────────────────────────────
+        # Temperature parameter per symbol (>1 = soften, <1 = sharpen).
+        # Isotonic mapping (sorted confidence bins → win rates) as fallback.
+        self.cal_temperature: Dict[str, float]         = defaultdict(lambda: 1.0)
+        self.cal_isotonic:    Dict[str, Optional[object]] = defaultdict(lambda: None)
+
+        # ── v3: Portfolio state ───────────────────────────────────────────
+        # Active positions: symbol → {direction, stake, open_time}
+        self.open_positions: Dict[str, dict] = {}
+        # Recent return correlation matrix (updated after each calibration)
+        self.return_correlations: Dict[Tuple[str,str], float] = {}
+
+        # Sequence accumulator
+        # v15 BUGFIX: these were single shared scalars/lists on state, not
+        # keyed by symbol. execute_single_step() runs concurrently across
+        # symbols (portfolio allocation can open several at once, each
+        # awaiting its own multi-minute settlement), so a later symbol's
+        # reset_sequence_accumulator() call overwrote these before an
+        # earlier symbol's still-in-flight trade resolved and read them
+        # back at save_trade()/emit_sequence_summary() time. Confirmed in
+        # production: conviction_outcome_report() found ZERO trades with a
+        # non-null conviction across 10 resolved trades and 8+ hours,
+        # despite regime routing computing real conviction values for these
+        # same symbols regularly (confirmed separately in earlier session
+        # logs) -- the values were being computed correctly and then
+        # clobbered before they were ever saved. Keying by symbol means
+        # concurrent symbols no longer share, and can no longer corrupt,
+        # each other's sequence bookkeeping (stakes/profits list included --
+        # that was equally capable of interleaving two symbols' martingale
+        # steps into one bogus summary, not just a conviction-tracking gap).
+        self.seq_stakes: Dict[str, list]    = defaultdict(list)
+        self.seq_profits: Dict[str, list]   = defaultdict(list)
+        self.seq_balance_before: Dict[str, float] = defaultdict(float)
+        self.seq_p_up: Dict[str, float]     = defaultdict(lambda: 0.5)
+        self.seq_confidence: Dict[str, float] = defaultdict(float)
+        self.seq_conviction: Dict[str, Optional[float]] = {}
+        self.seq_duration: Dict[str, int]   = defaultdict(int)
+        self.seq_duration_unit: Dict[str, str] = defaultdict(lambda: "t")
+
+    @property
+    def trade_in_progress(self) -> bool:
+        """True while at least one trade is in flight. Every existing
+        read (e.g. the main loop's `if state.trading_locked or
+        state.trade_in_progress:`) keeps working unchanged -- only the
+        underlying representation moved to a counter so it stays correct
+        when several trades are open at once."""
+        return self.trades_in_flight > 0
+
+
+@dataclass
+class SymbolModels:
+    fitted: bool = False
+    fitted_at: float = 0.0
+    origin_epoch: float = 0.0
+    tick_dt: float = 2.0             # actual measured dt at fit time, carried for re-use
+    hmm_model: Optional[object] = None
+    garch_result: Optional[object] = None
+    garch_scale: float = 1000.0
+    ou_params: Optional[dict] = None
+    hawkes_up: Optional[dict] = None
+    hawkes_up_events: Optional[np.ndarray] = None
+    hawkes_down: Optional[dict] = None
+    hawkes_down_events: Optional[np.ndarray] = None
+    # per-layer fusion weights learned from OOS correlation during deep calibration
+    # None means fall back to static defaults inside bayesian_fusion()
+    per_layer_weights: Optional[dict] = None
+
+
+class SymbolData:
+    def __init__(self, symbol, maxlen=12000, tick_dt=2.0):
+        self.symbol = symbol
+        self.tick_dt = tick_dt          # seconds per tick: 1.0 for 1HZ, ~2.0 for R_
+        self.ticks = deque(maxlen=maxlen)  # (epoch, price)
+
+    def add_tick(self, epoch, price):
+        self.ticks.append((epoch, price))
+
+    def prices(self):
+        return np.array([p for _, p in self.ticks], dtype=float)
+
+    def epochs(self):
+        return np.array([e for e, _ in self.ticks], dtype=float)
+
+    def returns(self):
+        p = self.prices()
+        if len(p) < 2:
+            return np.array([])
+        return np.diff(p) / p[:-1]
+
+    def mean_tick_dt(self):
+        """Compute actual mean inter-tick gap in seconds from the buffered epochs.
+        Used to verify the tick_dt assumption and for activity ranking."""
+        e = self.epochs()
+        if len(e) < 2:
+            return self.tick_dt
+        return float(np.mean(np.diff(e)))
+
+    def slice_copy(self, n):
+        """Returns a new SymbolData containing only the first n ticks, carrying
+        tick_dt through so re-fitted models use the correct rate."""
+        new_sd = SymbolData(self.symbol, maxlen=n + 10, tick_dt=self.tick_dt)
+        for e, p in list(self.ticks)[:n]:
+            new_sd.add_tick(e, p)
+        return new_sd
+
+    def _minute_bars(self, max_bars: Optional[int] = None):
+        """Shared resampling core for minute_bar_returns()/minute_bar_prices()
+        below -- one-per-minute last-observed-price bars, forward-filled
+        across any gap, oldest -> newest. Returns (epochs, prices), both
+        empty if fewer than 2 distinct minutes are buffered."""
+        epochs = self.epochs()
+        prices = self.prices()
+        if len(epochs) < 2:
+            return np.array([]), np.array([])
+
+        minute_idx = (epochs // 60).astype(np.int64)
+        first_min, last_min = int(minute_idx[0]), int(minute_idx[-1])
+        n_minutes = last_min - first_min + 1
+        if n_minutes < 2:
+            return np.array([]), np.array([])
+
+        bar_prices = np.full(n_minutes, np.nan, dtype=float)
+        rel_idx = minute_idx - first_min   # non-decreasing -> last write wins
+        bar_prices[rel_idx] = prices
+
+        nan_mask = np.isnan(bar_prices)
+        if nan_mask.any():
+            idx = np.where(~nan_mask, np.arange(n_minutes), 0)
+            np.maximum.accumulate(idx, out=idx)
+            bar_prices = bar_prices[idx]
+            if np.isnan(bar_prices[0]):
+                bar_prices[:1] = prices[0]
+
+        bar_epochs = (np.arange(n_minutes) + first_min) * 60.0
+        if max_bars is not None and n_minutes > max_bars:
+            bar_epochs = bar_epochs[-max_bars:]
+            bar_prices = bar_prices[-max_bars:]
+        return bar_epochs, bar_prices
+
+    def minute_bar_returns(self, max_bars: Optional[int] = None):
+        """Resamples the buffered tick stream into one-per-minute
+        last-observed-price bars, using the SAME last-observation /
+        forward-fill convention as risefall_lstm_train.build_minute_bars()
+        -- so the live minute LSTM model sees the same kind of series it
+        was trained on (settlement-instant price, not a synthetic OHLC
+        close; gaps forward-filled, never interpolated).
+
+        Returns simple returns (diff/price), oldest -> newest, trimmed to
+        the most recent `max_bars` bars if given (+1 extra bar so the
+        diff still yields exactly max_bars returns). Empty array if fewer
+        than 2 distinct minutes are buffered yet -- caller treats that the
+        same as "minute model not available for this symbol right now"."""
+        _, bar_prices = self._minute_bars(None if max_bars is None else max_bars + 1)
+        if len(bar_prices) < 2:
+            return np.array([])
+        return np.diff(bar_prices) / bar_prices[:-1]
+
+    def minute_bar_prices(self, max_bars: Optional[int] = None):
+        """Same resampling as minute_bar_returns() but returns the price
+        LEVEL series itself (not returns) -- what MinuteBarView.prices()
+        below hands to compute_features()/fit_symbol_models(), which
+        compute their own returns internally the same way SymbolData.
+        returns() does."""
+        _, bar_prices = self._minute_bars(max_bars)
+        return bar_prices
+
+    def minute_bar_epochs(self, max_bars: Optional[int] = None):
+        bar_epochs, _ = self._minute_bars(max_bars)
+        return bar_epochs
+
+
+class MinuteBarView:
+    """Thin adapter presenting a SymbolData's resampled MINUTE bars through
+    the exact same interface SymbolData itself exposes (.symbol, .prices(),
+    .epochs(), .returns(), .mean_tick_dt()) -- v9: this is what makes it
+    possible to feed the entire existing tick-native analytical stack
+    (compute_features(), fit_symbol_models(), and transitively every Gates
+    1-5 + Monte Carlo function that consumes their output) MINUTE-bar data
+    with zero changes to any of that code. Those functions were audited
+    (see conversation history) to confirm they only ever touch `sd` through
+    exactly this interface -- hmm_gbm_scan(), monte_carlo_duration(),
+    entropy_gate_passes(), multi_timeframe_confluence(), and
+    meta_ensemble_agrees() don't even take `sd` at all, just plain
+    prices/returns arrays, so they're already fully data-agnostic.
+
+    Built fresh once per symbol per scan cycle from the live SymbolData's
+    buffered ticks -- NOT backed by the trainer's persistent Supabase
+    minute-bar archive, so it's limited to however many minutes the bot's
+    own in-memory tick buffer (SymbolData(maxlen=...)) currently spans.
+    For a 1HZ symbol at the default maxlen=12000 that's up to ~200
+    minutes -- enough for WINDOW_SIZE_MINUTES=200-bar LSTM lookback with
+    little to spare, and enough for Gates 1-5's shorter internal windows,
+    but thinner than the trainer's archive-backed training data. If a
+    richer live minute-bar history turns out to matter, the same
+    Supabase-archive pattern from risefall-trainer could be added here
+    too -- not implemented in this pass."""
+
+    def __init__(self, sd: "SymbolData", max_bars: Optional[int] = None):
+        self.symbol = sd.symbol
+        self._epochs = sd.minute_bar_epochs(max_bars)
+        self._prices = sd.minute_bar_prices(max_bars)
+        # Real seconds between bars -- always 60 by construction (one bar
+        # per minute), NOT sd.tick_dt. Fed straight into fit_symbol_models()
+        # -> fit_ou()/fit_symbol_hawkes() etc, which parameterize by actual
+        # measured dt rather than assuming tick-scale timing, so this alone
+        # is what makes those fits statistically correct for minute-scale
+        # data rather than silently reusing tick-scale assumptions.
+        self.tick_dt = 60.0
+
+    def prices(self) -> np.ndarray:
+        return self._prices
+
+    def epochs(self) -> np.ndarray:
+        return self._epochs
+
+    def returns(self) -> np.ndarray:
+        p = self._prices
+        if len(p) < 2:
+            return np.array([])
+        return np.diff(p) / p[:-1]
+
+    def mean_tick_dt(self) -> float:
+        return 60.0
+
+    def has_data(self, min_bars: int = 30) -> bool:
+        return len(self._prices) >= min_bars
+
+
+# ---------------------------------------------------------------------------
+# DERIV API CLIENT - new Options API (REST OTP bootstrap, auto-reconnecting)
+# ---------------------------------------------------------------------------
+class DerivClient:
+    """
+    Client for the new Deriv Options API.
+
+    Auth flow: REST GET .../accounts -> resolve account_id -> REST POST
+    .../accounts/{id}/otp -> pre-authenticated WS URL. No `authorize`
+    message is sent or needed; the OTP URL is already scoped to the account.
+
+    OTP URLs are short-lived and single-use (per developers.deriv.com), so a
+    fresh one is fetched on every connect AND every reconnect. After the
+    first successful connect, this client auto-reconnects in the background
+    with exponential backoff and calls `resubscribe_cb` (if set) so the
+    caller can replay its balance/tick subscriptions.
+    """
+
+    HEARTBEAT_INTERVAL = 20
+    RECONNECT_BASE = 2.0
+    RECONNECT_CAP = 60.0
+
+    def __init__(self, app_id, token, account_type="demo", account_id=None):
+        self.app_id = app_id
+        self.token = token
+        self.account_type = account_type
+        self.account_id = account_id
+        self.ws = None
+        self.req_id = 0
+        self.pending = {}
+        self.subscriptions = defaultdict(list)  # msg_type -> list[asyncio.Queue]
+        self.account = None
+        self.resubscribe_cb = None  # async callable(client), replayed after reconnect
+        self._running = False
+        self._reader_task = None
+        self._ka_task = None
+
+    # ---- REST bootstrap ----
+    def _rest_headers(self):
+        return {
+            "Authorization": f"Bearer {self.token}",
+            "Deriv-App-ID": self.app_id,
+            "Content-Type": "application/json",
+        }
+
+    def _resolve_account_id_sync(self):
+        url = f"{API_BASE}{ACCOUNTS_PATH}"
+        resp = requests.get(url, headers=self._rest_headers(), timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        accounts = data.get("data", data) if isinstance(data, dict) else data
+        if isinstance(accounts, dict):
+            accounts = accounts.get("accounts", accounts.get("data", []))
+        for acc in accounts:
+            if acc.get("account_type") == self.account_type:
+                acc_id = acc.get("account_id") or acc.get("id")
+                if acc_id:
+                    return acc_id
+        raise RuntimeError(
+            f"No '{self.account_type}' account found via {ACCOUNTS_PATH}. "
+            f"Set DERIV_ACCOUNT_ID explicitly, or create one first via "
+            f"POST {ACCOUNTS_PATH}. Accounts returned: {data}"
+        )
+
+    def _fetch_otp_url_sync(self):
+        if not self.account_id:
+            self.account_id = self._resolve_account_id_sync()
+            print(f"Resolved {self.account_type} account_id = {self.account_id}")
+        url = f"{API_BASE}{OTP_PATH.format(account_id=self.account_id)}"
+        resp = requests.post(url, headers=self._rest_headers(), timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        payload = data.get("data", data) if isinstance(data, dict) else data
+        ws_url = payload.get("url")
+        if not ws_url:
+            raise RuntimeError(f"OTP response missing data.url: {data}")
+        return ws_url
+
+    async def _get_ws_url(self):
+        return await asyncio.to_thread(self._fetch_otp_url_sync)
+
+    # ---- connection lifecycle ----
+    async def connect(self):
+        """Connects once (raises on failure, so startup misconfiguration
+        fails fast) then runs the supervisor loop forever in the background."""
+        self._running = True
+        await self._connect_once()
+        asyncio.create_task(self._supervise())
+        return self.account
+
+    async def _connect_once(self):
+        ws_url = await self._get_ws_url()
+        self.ws = await websockets.connect(ws_url, ping_interval=None, close_timeout=5)
+        # IMPORTANT: start the reader (and heartbeat) BEFORE sending anything.
+        # `send()` blocks on a future that is only resolved by `_dispatch()`,
+        # which only runs inside `_read_loop()`. If the reader isn't already
+        # running, the balance handshake below times out forever (this was
+        # the cause of a repeated TimeoutError/CancelledError crash loop).
+        self._reader_task = asyncio.create_task(self._read_loop())
+        self._ka_task = asyncio.create_task(self._heartbeat())
+        bal = await self.send({"balance": 1})
+        self.account = bal.get("balance", {})
+        print(
+            f"Connected ({self.account_type}). "
+            f"loginid={self.account.get('loginid')} balance={self.account.get('balance')}"
+        )
+
+    async def _read_loop(self):
+        try:
+            async for message in self.ws:
+                self._dispatch(json.loads(message))
+        except (websockets.ConnectionClosed, OSError) as e:
+            print(f"[DerivClient] WS connection lost: {e}")
+
+    async def _supervise(self):
+        """Watches the current reader task; on disconnect, cleans up and
+        reconnects with exponential backoff, restarting reader+heartbeat
+        each time inside `_connect_once`."""
+        while self._running:
+            if self._reader_task is not None:
+                await self._reader_task
+
+            if self._ka_task is not None:
+                self._ka_task.cancel()
+            for fut in self.pending.values():
+                if not fut.done():
+                    fut.set_exception(ConnectionError("Deriv WS disconnected"))
+            self.pending.clear()
+            self.ws = None
+
+            if not self._running:
+                break
+
+            attempt = 0
+            while self._running and self.ws is None:
+                attempt += 1
+                delay = min(
+                    self.RECONNECT_BASE * (2 ** (attempt - 1)), self.RECONNECT_CAP
+                ) + random.uniform(0, 1)
+                print(f"[DerivClient] Reconnecting in {delay:.1f}s (attempt {attempt})...")
+                await asyncio.sleep(delay)
+                try:
+                    await self._connect_once()
+                    if self.resubscribe_cb:
+                        await self.resubscribe_cb(self)
+                except Exception as e:
+                    print(f"[DerivClient] Reconnect attempt {attempt} failed: {e}")
+
+    async def _heartbeat(self):
+        try:
+            while True:
+                await asyncio.sleep(self.HEARTBEAT_INTERVAL)
+                await self.ws.send(json.dumps({"ping": 1}))
+        except (asyncio.CancelledError, websockets.ConnectionClosed):
+            pass
+
+    def _dispatch(self, data):
+        req_id = data.get("req_id")
+        msg_type = data.get("msg_type")
+        if msg_type == "ping":
+            return
+        if req_id is not None and req_id in self.pending:
+            fut = self.pending.pop(req_id)
+            if not fut.done():
+                fut.set_result(data)
+                return
+        if msg_type in self.subscriptions:
+            for q in self.subscriptions[msg_type]:
+                q.put_nowait(data)
+
+    async def send(self, request, timeout=20):
+        self.req_id += 1
+        rid = self.req_id
+        request = dict(request)
+        request["req_id"] = rid
+        fut = asyncio.get_event_loop().create_future()
+        self.pending[rid] = fut
+        await self.ws.send(json.dumps(request))
+        return await asyncio.wait_for(fut, timeout=timeout)
+
+    def subscribe_channel(self, msg_type):
+        q = asyncio.Queue()
+        self.subscriptions[msg_type].append(q)
+        return q
+
+
+
+async def fetch_tradable_symbols(client):
+    """Fetches R_ volatility indices only (R_10/25/50/75/100).
+    Returns a list of verified CALL/PUT-eligible symbol names.
+    1HZ symbols are handled separately by select_top_1hz()."""
+    resp = await client.send({"active_symbols": "brief"})
+    if "error" in resp:
+        print(f"[fetch_tradable_symbols] active_symbols error: {resp['error']}")
+        return []
+
+    candidates = []
+    for s in resp.get("active_symbols", []):
+        symbol = s.get("underlying_symbol")
+        if not symbol or "1HZ" in symbol:
+            continue
+        if not symbol.startswith("R_"):
+            continue
+        if s.get("market") != "synthetic_index":
+            continue
+        if not s.get("exchange_is_open", 1):
+            continue
+        candidates.append(symbol)
+    print(f"[fetch_tradable_symbols] {len(candidates)} R_ candidates before contracts_for check")
+
+    verified = []
+    cf_errors = []
+    for symbol in candidates:
+        try:
+            cf = await client.send({"contracts_for": symbol})
+            if "error" in cf:
+                cf_errors.append(f"{symbol}: {cf['error']}")
+                continue
+            types = {c["contract_type"] for c in cf.get("contracts_for", {}).get("available", [])}
+            if "CALL" in types and "PUT" in types:
+                verified.append(symbol)
+        except Exception as e:
+            cf_errors.append(f"{symbol}: {type(e).__name__}: {e}")
+        await asyncio.sleep(0.05)
+
+    if cf_errors:
+        print(f"[fetch_tradable_symbols] {len(cf_errors)} contracts_for calls failed, e.g.: {cf_errors[:3]}")
+    print(f"[fetch_tradable_symbols] verified R_ symbols: {verified}")
+    return verified
+
+
+async def select_top_1hz(client, n_top=3):
+    """Fetches all 1HZ synthetic-index symbols that support CALL/PUT, bootstraps
+    a short tick history for each, then ranks by tick-flow consistency (lowest
+    coefficient-of-variation of inter-tick gaps = most active / most liquid).
+    Returns the top n_top as a list of symbol names.
+
+    Why consistency rather than just speed: all 1HZ symbols nominally tick every
+    second, but some have gaps and bursts (irregular flow) while others tick very
+    evenly. Even gap distribution means more reliable statistical model fitting
+    and more predictable execution timing."""
+    resp = await client.send({"active_symbols": "brief"})
+    if "error" in resp:
+        print(f"[select_top_1hz] active_symbols error: {resp['error']}")
+        return []
+
+    candidates = []
+    for s in resp.get("active_symbols", []):
+        symbol = s.get("underlying_symbol")
+        if not symbol or "1HZ" not in symbol:
+            continue
+        if s.get("market") != "synthetic_index":
+            continue
+        if not s.get("exchange_is_open", 1):
+            continue
+        candidates.append(symbol)
+
+    print(f"[select_top_1hz] {len(candidates)} 1HZ candidates found: {candidates}")
+
+    # verify CALL/PUT support
+    verified = []
+    for symbol in candidates:
+        try:
+            cf = await client.send({"contracts_for": symbol})
+            if "error" in cf:
+                continue
+            types = {c["contract_type"] for c in cf.get("contracts_for", {}).get("available", [])}
+            if "CALL" in types and "PUT" in types:
+                verified.append(symbol)
+        except Exception:
+            continue
+        await asyncio.sleep(0.05)
+
+    print(f"[select_top_1hz] {len(verified)} CALL/PUT-eligible 1HZ symbols: {verified}")
+
+    if not verified:
+        return []
+
+    # bootstrap a short history for each candidate and measure tick consistency
+    scores = {}
+    for symbol in verified:
+        try:
+            resp2 = await client.send({
+                "ticks_history": symbol, "count": 200, "end": "latest", "style": "ticks"
+            })
+            times = resp2.get("history", {}).get("times", [])
+            if len(times) < 10:
+                continue
+            gaps = [times[i+1] - times[i] for i in range(len(times)-1)]
+            mean_gap = sum(gaps) / len(gaps)
+            std_gap = (sum((g - mean_gap)**2 for g in gaps) / len(gaps)) ** 0.5
+            cv = std_gap / mean_gap if mean_gap > 0 else 999
+            scores[symbol] = cv
+            print(f"[select_top_1hz] {symbol}: mean_gap={mean_gap:.2f}s  cv={cv:.3f}")
+        except Exception as e:
+            print(f"[select_top_1hz] {symbol}: bootstrap failed: {e}")
+        await asyncio.sleep(0.05)
+
+    if not scores:
+        print("[select_top_1hz] no consistency data collected, returning all verified (up to n_top)")
+        return verified[:n_top]
+
+    ranked = sorted(scores, key=scores.get)          # ascending CV = most consistent first
+    top = ranked[:n_top]
+    print(f"[select_top_1hz] top {n_top} by tick consistency: {top}")
+    return top
+
+
+
+async def fetch_history(client, symbol, count=HISTORY_BOOTSTRAP_COUNT):
+    """Fetch up to `count` ticks by paging backwards in time.
+    Deriv's ticks_history API hard-caps each response at 1000 ticks regardless
+    of the count parameter — confirmed in live logs (always returns 1000).
+    We work around this by making ceil(count/1000) sequential calls, each time
+    using the earliest timestamp from the previous batch as the new `end` value
+    so the next call fetches the 1000 ticks immediately before that point."""
+    BATCH = 1000
+    all_ticks = []
+    end = "latest"
+
+    while len(all_ticks) < count:
+        resp = await client.send({
+            "ticks_history": symbol,
+            "count": BATCH,
+            "end": end,
+            "style": "ticks",
+        })
+        history = resp.get("history", {})
+        times  = history.get("times",  [])
+        prices = history.get("prices", [])
+        if not times:
+            break   # no more history available
+
+        batch = list(zip(times, prices))
+        # Prepend so earlier ticks come first in final list
+        all_ticks = batch + all_ticks
+
+        if len(batch) < BATCH:
+            break   # API returned fewer than requested — we've hit the start of available history
+
+        # Next call: fetch ticks ending just before the earliest tick in this batch
+        earliest_epoch = int(times[0]) - 1
+        end = earliest_epoch
+
+    # Trim to requested count (most recent ticks)
+    if len(all_ticks) > count:
+        all_ticks = all_ticks[-count:]
+
+    return all_ticks
+
+
+async def buy_contract(client, symbol, direction, duration, duration_unit, stake):
+    contract_type = "CALL" if direction > 0 else "PUT"
+    req = {
+        "buy": "1",
+        "price": stake,
+        "parameters": {
+            "amount": stake,
+            "basis": "stake",
+            "contract_type": contract_type,
+            "currency": "USD",
+            "duration": int(duration),   # Deriv requires integer; guard against numpy int / float
+            "duration_unit": duration_unit,
+            "underlying_symbol": symbol,
+        },
+    }
+    resp = await client.send(req)
+    if "error" in resp:
+        raise RuntimeError(resp["error"].get("message", "buy failed"))
+    return resp["buy"]["contract_id"]
+
+
+async def wait_for_contract_result(client, contract_id, duration_seconds=None):
+    """
+    Waits for a contract to settle, with a HARD TIMEOUT.
+
+    Previously this was an unbounded `while True` on the subscription queue.
+    If the settlement message was dropped, delayed, or the subscription
+    silently died, the coroutine waited forever and the bot froze with the
+    symbol permanently locked — no further trades on that symbol for the
+    rest of the process lifetime.
+
+    Now: wait until the contract's own duration has elapsed plus
+    CONTRACT_SETTLE_GRACE_SECS (default 60s — one minute past expiry, as
+    requested). If nothing has arrived by then, actively poll the contract
+    state once via proposal_open_contract rather than trusting the stream,
+    and if that also fails, give up and unlock so the bot keeps trading.
+
+    Returns (won: bool, profit: float). On timeout with no resolution the
+    profit is reported as 0.0 and won=False — a neutral non-result rather
+    than a fabricated win or loss, so P&L is not corrupted by a guess.
+    """
+    q = client.subscribe_channel("proposal_open_contract")
+    await client.send({"proposal_open_contract": 1,
+                       "contract_id": contract_id, "subscribe": 1})
+
+    if duration_seconds is None:
+        duration_seconds = 300.0
+    deadline = time.time() + float(duration_seconds) + CONTRACT_SETTLE_GRACE_SECS
+
+    while True:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        try:
+            data = await asyncio.wait_for(q.get(), timeout=remaining)
+        except asyncio.TimeoutError:
+            break
+        poc = data.get("proposal_open_contract", {})
+        if poc.get("contract_id") == contract_id and poc.get("is_sold"):
+            profit = float(poc.get("profit", 0))
+            return profit > 0, profit
+
+    # Deadline hit — poll once directly instead of trusting the stream.
+    print(f"[Settle] contract {contract_id} not settled via stream after "
+          f"{duration_seconds:.0f}s + {CONTRACT_SETTLE_GRACE_SECS}s grace "
+          f"— polling directly")
+    try:
+        await client.send({"proposal_open_contract": 1,
+                           "contract_id": contract_id})
+        poll = await asyncio.wait_for(q.get(), timeout=15)
+        poc = poll.get("proposal_open_contract", {})
+        if poc.get("contract_id") == contract_id and poc.get("is_sold"):
+            profit = float(poc.get("profit", 0))
+            print(f"[Settle] direct poll resolved {contract_id}: "
+                  f"profit={profit:+.2f}")
+            return profit > 0, profit
+    except Exception as exc:
+        print(f"[Settle] direct poll failed for {contract_id}: {exc}")
+
+    print(f"[Settle] FORCED UNLOCK — {contract_id} unresolved. Reporting "
+          f"neutral (0.00) so P&L is not corrupted by a guess, and "
+          f"releasing the symbol so trading continues.")
+    return False, 0.0
+
+
+# ---------------------------------------------------------------------------
+# LSTM MODEL LOADING (risefall_lstm_model.py / risefall_lstm_train.py)
+# ---------------------------------------------------------------------------
+# Same table both MODEL_KIND=tick and MODEL_KIND=minute cron runs of
+# risefall_lstm_train.py upsert into, one row per kind (key="current_tick" /
+# key="current_minute"). Purely additive to the live bot's existing
+# SupabaseStore state -- separate table, read-only from here, never written.
+LSTM_SUPABASE_TABLE = "bot_risefall_lstm_model"
+
+_lstm_tick_model = None
+_lstm_minute_model = None
+
+
+def maybe_reload_lstm_models(force: bool = False):
+    """LSTM removed -- kept as a no-op so call sites stay unchanged."""
+    return
+
+
+# ---------------------------------------------------------------------------
+def markov_directional_prob(returns, order=2, alpha_smooth=1.0):
+    signs = np.sign(returns)
+    signs = signs[signs != 0]
+    if len(signs) < order + 20:
+        return 0.5
+    table = defaultdict(lambda: [alpha_smooth, alpha_smooth])  # [down_count, up_count]
+    for i in range(len(signs) - order):
+        state = tuple(signs[i:i + order])
+        idx = 1 if signs[i + order] > 0 else 0
+        table[state][idx] += 1
+    current_state = tuple(signs[-order:])
+    down_c, up_c = table[current_state]
+    return float(up_c / (up_c + down_c))
+
+
+# ---------------------------------------------------------------------------
+# LAYER 2: HIDDEN MARKOV MODEL (real Baum-Welch fit via hmmlearn)
+# ---------------------------------------------------------------------------
+def fit_hmm(returns, n_states=2):
+    """
+    FIX v3: Default changed from n_states=3 to n_states=2.
+
+    Live log analysis confirmed 'falling back to 2-state model' appeared for
+    EVERY symbol on EVERY calibration cycle without exception. The 3-state
+    attempt was burning through 4 random seeds (all failing the degeneracy
+    check) before falling back to 4 more 2-state seeds — wasting ~50% of
+    HMM fitting compute on a path that was universally rejected. Tick-level
+    synthetic index returns only support 2 genuine regimes (calm/excited),
+    so 2-state is the correct model complexity. Defaulting to it directly
+    eliminates the wasted 3-state seed attempts and gives the 2-state model
+    a cleaner, faster fit on every calibration cycle.
+    The multi-seed and degeneracy-check logic is kept in case a caller
+    explicitly requests n_states=3 in future, but normal operation no longer
+    hits it.
+    """
+    if len(returns) < MIN_TICKS_FOR_FIT:
+        return None
+
+    X = returns.reshape(-1, 1)
+
+    def _try_fit(k, seeds=(42, 7, 123, 2024)):
+        best_model, best_score = None, -np.inf
+        for seed in seeds:
+            try:
+                m = GaussianHMM(n_components=k, covariance_type="diag",
+                                n_iter=100, random_state=seed,
+                                min_covar=1e-4)
+                m.fit(X)
+                score = m.score(X)
+                stat_dist = m.get_stationary_distribution()
+                is_degenerate = bool(np.min(stat_dist) < 0.05)
+                if not is_degenerate and score > best_score:
+                    best_model, best_score = m, score
+            except Exception:
+                continue
+        return best_model
+
+    # Direct 2-state fit — no wasted 3-state attempts
+    model = _try_fit(n_states)
+    if model is not None:
+        return model
+
+    # Fallback: try higher state count if explicitly requested and 2-state failed
+    if n_states > 2:
+        print(f"[HMM] {n_states}-state fit degenerate on all seeds — "
+              f"falling back to 2-state model.")
+        model = _try_fit(2)
+        if model is not None:
+            return model
+
+    # Last resort: accept borderline fit rather than no HMM signal at all
+    try:
+        m = GaussianHMM(n_components=2, covariance_type="diag",
+                        n_iter=100, random_state=42, min_covar=1e-4)
+        m.fit(X)
+        return m
+    except Exception as e:
+        print(f"[HMM] fit failed entirely: {e}")
+        return None
+
+
+def hmm_trend_weight(model, recent_returns):
+    """
+    Returns (trend_weight, directional_lean).
+
+    FIX v2: The original computed lean = sum(posterior * HMM_means) and then
+    applied tanh(lean * 200). For synthetic index log-returns, HMM state means
+    are O(1e-4), so lean ≈ 1e-4 and tanh(1e-4 * 200) ≈ 0.02 — the lean
+    signal was effectively zero on every tick (confirmed: HMM max value was
+    0.0018 across all 90 live trades).
+
+    Fix: normalise the raw lean by the actual standard deviation of recent
+    returns BEFORE applying tanh. This makes the signal dimensionless and
+    proportional to genuine directional persistence in return units, so it
+    reaches ±1 when the regime state genuinely favours a direction.
+
+    momentum_mode now also requires BOTH trend_weight > 0.60 AND h > 0.55
+    (h > 0.52 was too easy to trigger given measurement noise around 0.5).
+    """
+    if model is None or len(recent_returns) < 5:
+        return 0.5, 0.0
+    try:
+        X = recent_returns.reshape(-1, 1)
+        posteriors  = model.predict_proba(X)
+        current     = posteriors[-1]
+        means       = model.means_.flatten()
+        variances   = np.array([np.sqrt(c[0][0]) for c in model.covars_])
+
+        # Raw lean in return units (O(1e-4) for synthetic indices)
+        lean_raw    = float(np.sum(current * means))
+
+        # Normalise: express lean in units of recent-return std
+        return_std  = float(np.std(recent_returns)) + 1e-8
+        lean_norm   = lean_raw / return_std          # dimensionless, O(1)
+
+        # tanh maps to [-1, +1] with natural saturation at 3× std
+        lean_signal = float(np.tanh(lean_norm * 3))
+
+        dominant    = int(np.argmax(current))
+        vol_rank    = variances[dominant] / (np.max(variances) + 1e-9)
+        trend_weight = float(np.clip(1.0 - vol_rank, 0.2, 0.85))
+        return trend_weight, lean_signal
+    except Exception:
+        return 0.5, 0.0
+
+
+# ---------------------------------------------------------------------------
+# LAYER 3: HAWKES PROCESS (real exponential-kernel MLE fit via scipy)
+# ---------------------------------------------------------------------------
+def hawkes_negloglik(params, event_times, T):
+    mu, alpha, beta = params
+    if mu <= 0 or alpha < 0 or beta <= 0 or alpha >= beta:
+        return 1e10
+    ll = -mu * T
+    A = 0.0
+    last_t = 0.0
+    for i, ti in enumerate(event_times):
+        if i > 0:
+            A = math.exp(-beta * (ti - last_t)) * (1 + A)
+        lam = mu + alpha * A
+        if lam <= 0:
+            return 1e10
+        ll += math.log(lam)
+        last_t = ti
+    comp = (alpha / beta) * np.sum(1 - np.exp(-beta * (T - event_times)))
+    ll -= comp
+    return -ll
+
+
+def fit_hawkes(event_times, T):
+    if len(event_times) < 10 or T <= 0:
+        return None
+    init = [max(len(event_times) / T * 0.5, 1e-4), 0.3, 1.0]
+    try:
+        res = minimize(
+            hawkes_negloglik, init, args=(event_times, T),
+            bounds=[(1e-6, None), (0.0, None), (1e-6, None)],
+            method="L-BFGS-B",
+        )
+        if not res.success:
+            return None
+        mu, alpha, beta = res.x
+        if alpha >= beta:
+            return None
+        return {"mu": mu, "alpha": alpha, "beta": beta}
+    except Exception as e:
+        print(f"[Hawkes] fit failed: {e}")
+        return None
+
+
+def hawkes_intensity_now(params, event_times, current_t):
+    if params is None or event_times is None or len(event_times) == 0:
+        return 0.0
+    mu, alpha, beta = params["mu"], params["alpha"], params["beta"]
+    past = event_times[event_times <= current_t]
+    if len(past) == 0:
+        return mu
+    excitation = np.sum(alpha * np.exp(-beta * (current_t - past)))
+    return float(mu + excitation)
+
+
+def fit_symbol_hawkes(sd):
+    returns = sd.returns()
+    epochs = sd.epochs()
+    if len(returns) < MIN_TICKS_FOR_FIT:
+        return None, None, None, None, None
+    thresh = 0.5 * np.std(returns) if np.std(returns) > 0 else 1e-9
+    origin = epochs[0]
+    event_epochs = epochs[1:]
+    up_times = (event_epochs[returns > thresh] - origin).astype(float)
+    down_times = (event_epochs[returns < -thresh] - origin).astype(float)
+    T = float(epochs[-1] - origin)
+    hawkes_up = fit_hawkes(up_times, T) if len(up_times) >= 10 else None
+    hawkes_down = fit_hawkes(down_times, T) if len(down_times) >= 10 else None
+    return origin, hawkes_up, up_times, hawkes_down, down_times
+
+
+# ---------------------------------------------------------------------------
+# LAYER 4: ORNSTEIN-UHLENBECK (OLS / Vasicek-style calibration)
+# ---------------------------------------------------------------------------
+def fit_ou(prices, dt=1.0):
+    if len(prices) < 30:
+        return None
+    x, y = prices[:-1], prices[1:]
+    try:
+        b, a = np.polyfit(x, y, 1)
+    except Exception:
+        return None
+    b = float(np.clip(b, 1e-6, 0.999999))
+    theta = -math.log(b) / dt
+    mu = a / (1 - b)
+    resid = y - (a + b * x)
+    resid_var = np.var(resid)
+    denom = 1 - b ** 2
+    sigma = math.sqrt(resid_var * 2 * theta / denom) if denom > 1e-9 else math.sqrt(max(resid_var, 1e-12))
+    return {"theta": theta, "mu": mu, "sigma": sigma}
+
+
+def ou_reversion_signal(prices, ou_params):
+    if ou_params is None or len(prices) < 2:
+        return {"z": 0.0, "reversion_dir": 0.0, "strength": 0.0}
+    mu, sigma = ou_params["mu"], (ou_params["sigma"] if ou_params["sigma"] > 0 else 1e-9)
+    z = (prices[-1] - mu) / sigma
+    theta_norm = float(np.clip(ou_params["theta"], 0, 5) / 5)
+    strength = float(np.clip(abs(z) / 2 * theta_norm, 0, 1))
+    return {"z": float(z), "reversion_dir": float(-np.sign(z)), "strength": strength}
+
+
+# ---------------------------------------------------------------------------
+# LAYER 5: HURST EXPONENT (real rescaled-range / R-S analysis)
+# ---------------------------------------------------------------------------
+def hurst_rs(prices, min_window=10):
+    """
+    FIX v2: Compute Hurst on LOG-RETURNS, not on prices.
+
+    The original used absolute prices. Prices on a random walk exhibit
+    a spurious long-range trend (they never revert to a fixed mean) so
+    R/S analysis on prices always converges to H≈1.0 regardless of the
+    true underlying dynamics. This produced hurst_signal=+1.0 on every
+    single tick, forcing momentum_mode=True permanently and injecting a
+    structural CALL bias into every Bayesian fusion that no other layer
+    could overcome.
+
+    Log-returns are stationary, zero-mean, and bounded — R/S on returns
+    gives a meaningful Hurst estimate in [0.3, 0.7] for synthetic indices.
+    """
+    prices = np.asarray(prices, dtype=float)
+    if len(prices) < 102:
+        return 0.5
+    # Convert to log-returns — stationary series with meaningful Hurst
+    series = np.diff(np.log(np.maximum(prices, 1e-10)))
+    n = len(series)
+    if n < 50:
+        return 0.5
+    max_window = n // 2
+    window_sizes = np.unique(
+        np.logspace(np.log10(min_window), np.log10(max_window), num=20).astype(int)
+    )
+    rs_points = []
+    for w in window_sizes:
+        n_chunks = n // w
+        if n_chunks < 1:
+            continue
+        rs_chunk = []
+        for i in range(n_chunks):
+            chunk = series[i * w:(i + 1) * w]
+            mean  = np.mean(chunk)
+            dev   = np.cumsum(chunk - mean)
+            R     = np.max(dev) - np.min(dev)
+            S     = np.std(chunk)
+            if S > 0:
+                rs_chunk.append(R / S)
+        if rs_chunk:
+            rs_points.append((w, np.mean(rs_chunk)))
+    if len(rs_points) < 3:
+        return 0.5
+    log_w  = np.log([w for w, _ in rs_points])
+    log_rs = np.log([rs for _, rs in rs_points])
+    slope, _ = np.polyfit(log_w, log_rs, 1)
+    return float(np.clip(slope, 0.0, 1.0))
+
+
+# ---------------------------------------------------------------------------
+# LAYER 6: ARFIMA-STYLE LONG MEMORY (fractional differencing + AR(1))
+# ---------------------------------------------------------------------------
+def fractional_diff_weights(d, size):
+    w = [1.0]
+    for k in range(1, size):
+        w.append(-w[-1] * (d - k + 1) / k)
+    return np.array(w[::-1])
+
+
+def arfima_bias(returns, hurst, lookback=150):
+    if len(returns) < 60:
+        return 0.0
+    d = float(np.clip(hurst - 0.5, -0.49, 0.49))
+    recent = returns[-lookback:]
+    n = len(recent)
+    w = fractional_diff_weights(d, n)
+    diff_series = np.convolve(recent, w, mode="valid")
+    if len(diff_series) < 15:
+        return float(np.tanh(diff_series[-1] * 50)) if len(diff_series) else 0.0
+    try:
+        ar_model = AutoReg(diff_series, lags=1, old_names=False).fit()
+        forecast = ar_model.predict(start=len(diff_series), end=len(diff_series)).iloc[0]
+    except Exception:
+        forecast = diff_series[-1]
+    return float(np.tanh(forecast * 50))
+
+
+# ---------------------------------------------------------------------------
+# LAYER 7: GARCH(1,1) (real MLE fit via the `arch` package)
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# CONFIRMATION LAYERS (L13-L18) — no model fitting needed, evaluate live
+# ---------------------------------------------------------------------------
+def compute_rsi(prices, period=14, momentum_mode=False):
+    """L13a: RSI. Regime-aware polarity.
+    momentum_mode=False (ranging)  — mean-reversion: RSI<30 → +signal, RSI>70 → -signal
+    momentum_mode=True  (trending) — momentum: RSI>55 → +signal, RSI<45 → -signal"""
+    if len(prices) < period + 2:
+        return 50.0, 0.0
+    deltas   = np.diff(prices[-(period + 2):])
+    gains    = np.where(deltas > 0, deltas, 0.0)
+    losses   = np.where(deltas < 0, -deltas, 0.0)
+    avg_gain = np.mean(gains[-period:])
+    avg_loss = np.mean(losses[-period:])
+    if avg_loss == 0:
+        rsi = 100.0
+    else:
+        rs  = avg_gain / avg_loss
+        rsi = 100.0 - (100.0 / (1 + rs))
+    if momentum_mode:
+        if rsi > 55:   signal = (rsi - 55) / 45
+        elif rsi < 45: signal = -(45 - rsi) / 45
+        else:          signal = 0.0
+    else:
+        if rsi < 30:   signal = (30 - rsi) / 30
+        elif rsi > 70: signal = -(rsi - 70) / 30
+        else:          signal = 0.0
+    return float(rsi), float(np.clip(signal, -1, 1))
+
+
+def compute_stoch_rsi(prices, rsi_period=14, stoch_period=14, momentum_mode=False):
+    """L13b: Stochastic RSI. Regime-aware polarity.
+    momentum_mode=False → mean-reversion: stoch<0.2 = +signal, stoch>0.8 = -signal
+    momentum_mode=True  → momentum:       stoch>0.6 = +signal, stoch<0.4 = -signal"""
+    if len(prices) < rsi_period + stoch_period + 5:
+        return 0.5, 0.0
+    rsi_series = []
+    for i in range(stoch_period):
+        rsi_val, _ = compute_rsi(prices[:len(prices) - (stoch_period - i - 1)],
+                                  rsi_period, momentum_mode=False)
+        rsi_series.append(rsi_val)
+    rsi_series = np.array(rsi_series)
+    lo, hi = np.min(rsi_series), np.max(rsi_series)
+    if hi == lo:
+        return 0.5, 0.0
+    stoch_k = (rsi_series[-1] - lo) / (hi - lo)
+    if momentum_mode:
+        if stoch_k > 0.6:   signal = (stoch_k - 0.6) / 0.4
+        elif stoch_k < 0.4: signal = -(0.4 - stoch_k) / 0.4
+        else:                signal = 0.0
+    else:
+        if stoch_k < 0.2:   signal = (0.2 - stoch_k) / 0.2
+        elif stoch_k > 0.8: signal = -(stoch_k - 0.8) / 0.2
+        else:                signal = 0.0
+    return float(stoch_k), float(np.clip(signal, -1, 1))
+
+
+def compute_adx(prices, period=14, bar_size=5):
+    """L14: ADX trend-strength filter on BAR data, not raw ticks.
+
+    FIX v3: ADX was permanently 0.0000 on all 11 live trades even after the
+    v2 threshold fix (20→12). Root cause: tick-to-tick price differences on
+    Deriv synthetic indices are at floating-point noise level (O(0.0001)).
+    PDM and NDM at that resolution are also O(0.0001), making ATR≈0 and
+    producing ADX≈0 regardless of actual trend strength.
+
+    Fix: aggregate raw ticks into `bar_size`-tick bars (same approach used
+    by multi_timeframe_confluence) before computing ADX. At 5-tick bars the
+    bar-to-bar price differences are O(0.001-0.01) — large enough for ATR
+    to be non-zero and for PDM/NDM to carry directional information.
+    Requires period * bar_size * 2 raw ticks (140 ticks with defaults).
+
+    Returns (adx_value, trend_strength_0_to_1, direction_bias +1/-1/0).
+    """
+    min_ticks = period * bar_size * 2
+    if len(prices) < min_ticks:
+        return 20.0, 0.3, 0.0
+
+    # Aggregate into bar_size-tick bars using close prices
+    n_bars = len(prices) // bar_size
+    bars   = prices[:n_bars * bar_size].reshape(n_bars, bar_size)
+    # Use open (first) and close (last) of each bar for H/L approximation
+    highs  = np.max(bars, axis=1)
+    lows   = np.min(bars, axis=1)
+    closes = bars[:, -1]
+
+    if len(closes) < period * 2 + 1:
+        return 20.0, 0.3, 0.0
+
+    tr_list, pdm_list, ndm_list = [], [], []
+    for i in range(1, len(closes)):
+        # True range using prior close as reference
+        tr  = max(highs[i] - lows[i],
+                  abs(highs[i] - closes[i-1]),
+                  abs(lows[i]  - closes[i-1]))
+        pdm = max(highs[i] - highs[i-1], 0.0)
+        ndm = max(lows[i-1] - lows[i],   0.0)
+        # Directional move convention: only count if dominant direction
+        if pdm > ndm:
+            ndm = 0.0
+        elif ndm > pdm:
+            pdm = 0.0
+        tr_list.append(tr)
+        pdm_list.append(pdm)
+        ndm_list.append(ndm)
+
+    tr_a  = np.array(tr_list[-period * 2:])
+    pdm_a = np.array(pdm_list[-period * 2:])
+    ndm_a = np.array(ndm_list[-period * 2:])
+
+    # Wilder smoothing (EMA-style)
+    def _wilder(arr, p):
+        if len(arr) < p:
+            return float(np.mean(arr))
+        s = float(np.sum(arr[:p]))
+        for v in arr[p:]:
+            s = s - s / p + v
+        return s / p
+
+    atr = _wilder(tr_a, period)
+    if atr < 1e-10:
+        return 20.0, 0.3, 0.0
+
+    pdi = 100 * _wilder(pdm_a, period) / atr
+    ndi = 100 * _wilder(ndm_a, period) / atr
+    dx  = 100 * abs(pdi - ndi) / (pdi + ndi + 1e-9)
+
+    # Rolling DX for smoothed ADX
+    dx_list = []
+    for i in range(period, len(tr_a)):
+        t = _wilder(tr_a[:i+1], period)
+        if t < 1e-10:
+            continue
+        p_ = 100 * _wilder(pdm_a[:i+1], period) / t
+        n_ = 100 * _wilder(ndm_a[:i+1], period) / t
+        dx_list.append(100 * abs(p_ - n_) / (p_ + n_ + 1e-9))
+    adx = float(_wilder(np.array(dx_list), period)) if dx_list else dx
+    adx = float(np.clip(adx, 0, 100))
+
+    # Threshold tuned for bar-level data: ADX=15 → mild trend, ADX=32 → strong
+    trend_strength = float(np.clip((adx - 12) / 20, 0, 1))
+    up_bias        = float(np.sign(pdi - ndi))
+    return adx, trend_strength, up_bias
+
+
+def compute_bollinger(prices, period=20, n_std=2.0, momentum_mode=False):
+    """L15: Bollinger Band %B. Regime-aware polarity.
+    momentum_mode=False (ranging)  — mean-reversion: upper band → -signal (expect down)
+    momentum_mode=True  (trending) — momentum: upper band → +signal (trend continues up)"""
+    if len(prices) < period + 2:
+        return 0.5, 0.0
+    window = prices[-period:]
+    mid    = np.mean(window)
+    std    = np.std(window)
+    if std == 0:
+        return 0.5, 0.0
+    upper  = mid + n_std * std
+    lower  = mid - n_std * std
+    pct_b  = float(np.clip((prices[-1] - lower) / (upper - lower + 1e-9), -0.5, 1.5))
+    if momentum_mode:
+        signal = float(np.clip((pct_b - 0.5) * 2, -1, 1))   # follow: +1 at upper, -1 at lower
+    else:
+        signal = float(np.clip((0.5 - pct_b) * 2, -1, 1))   # fade:   +1 at lower, -1 at upper
+    return pct_b, signal
+
+
+def compute_zscore(prices, period=50, momentum_mode=False):
+    """L16: Z-score of price vs rolling mean. Regime-aware polarity.
+    momentum_mode=False (ranging)  — fade the move: high z → -signal (expect reversion)
+    momentum_mode=True  (trending) — follow the move: high z → +signal (trend continues)"""
+    if len(prices) < period + 2:
+        return 0.0, 0.0
+    window = prices[-period:]
+    mu     = np.mean(window)
+    sigma  = np.std(window) if np.std(window) > 0 else 1e-9
+    z      = (prices[-1] - mu) / sigma
+    if momentum_mode:
+        signal = float(np.clip(z / 2,  -1, 1))   # follow the move
+    else:
+        signal = float(np.clip(-z / 2, -1, 1))   # fade the move
+    return float(z), signal
+
+
+def compute_support_resistance(prices, lookback=100, n_levels=5,
+                               proximity_atr_mult=0.5, momentum_mode=False):
+    """L19 (v10, new): Support/Resistance proximity signal via swing-point
+    (local extrema) clustering. Every other technical layer in this stack
+    (RSI/StochRSI/Bollinger/Z-score/ADX above) is a rolling-STATISTIC
+    signal -- this is deliberately different: it's LEVEL-based, the
+    classic "does price respect a specific price level it's touched
+    before" technique, which is genuinely orthogonal information a
+    rolling mean/std can't capture (two prices can have identical
+    Bollinger %B or Z-score while one sits right at a level that's
+    rejected price three times and the other sits in open space).
+
+    Method:
+      1. Find swing highs/lows over `lookback` bars -- a bar is a swing
+         point if it's the local max/min within a small +/-`order`
+         neighborhood (the standard swing-point definition).
+      2. Cluster nearby swing points into LEVELS (merge any within a
+         volatility-scaled tolerance of each other) -- a level's
+         "strength" is how many times price has touched near it.
+      3. Find the nearest resistance (above current price) and nearest
+         support (below current price) among the strongest levels.
+      4. Signal is proximity-weighted (closer to a level = stronger
+         pull) and strength-weighted (more-touched levels matter more).
+
+    momentum_mode=False (ranging)  -- classic S/R: near resistance ->
+        expect rejection (-signal, i.e. lean PUT); near support ->
+        expect a bounce (+signal, lean CALL).
+    momentum_mode=True  (trending) -- breakout logic: price already
+        pushed THROUGH a level in the trend's direction is treated as
+        continuation confirmation (a broken resistance becomes support
+        and vice versa -- the classic "polarity flip") rather than
+        something to fade.
+
+    Returns (nearest_level_distance_in_vol_units, signal). signal in
+    [-1, 1]; both 0.0 if there's too little data to find any levels."""
+    prices = np.asarray(prices, dtype=float)
+    if len(prices) > lookback:
+        prices = prices[-lookback:]
+    n = len(prices)
+    if n < 20:
+        return 0.0, 0.0
+    current = float(prices[-1])
+
+    # Volatility proxy (ATR-like: mean absolute bar-to-bar move) sets the
+    # scale for both clustering tolerance and proximity decay -- so this
+    # layer adapts automatically to each symbol's own native volatility
+    # rather than using an absolute price-distance threshold that would
+    # be meaningless across symbols of very different scale.
+    vol_proxy = float(np.mean(np.abs(np.diff(prices))))
+    if vol_proxy < 1e-12:
+        return 0.0, 0.0
+    tolerance = max(proximity_atr_mult * vol_proxy * 5, current * 1e-5)
+
+    order = 3          # classic swing-point neighborhood half-width
+    min_recency = 10   # a "level" within a handful of bars of the current
+                       # price isn't a level at all yet -- it's just the
+                       # immediate noise price is sitting in right now.
+                       # Without this floor, a noisy near-flat tail
+                       # spuriously detects local extrema 1-3 bars old
+                       # right next to current price, which then dominate
+                       # the proximity-weighted signal despite not being
+                       # a real historical level price could return to.
+    swing_highs, swing_lows = [], []
+    for i in range(order, n - max(order, min_recency)):
+        seg = prices[i - order:i + order + 1]
+        if prices[i] == seg.max() and np.argmax(seg) == order:
+            swing_highs.append(prices[i])
+        if prices[i] == seg.min() and np.argmin(seg) == order:
+            swing_lows.append(prices[i])
+
+    def _cluster_levels(points, tol):
+        if not points:
+            return []
+        pts = sorted(points)
+        clusters = [[pts[0]]]
+        for p in pts[1:]:
+            if p - clusters[-1][-1] <= tol:
+                clusters[-1].append(p)
+            else:
+                clusters.append([p])
+        return [(float(np.mean(c)), len(c)) for c in clusters]
+
+    resistance_levels = sorted(_cluster_levels(swing_highs, tolerance), key=lambda x: -x[1])[:n_levels]
+    support_levels    = sorted(_cluster_levels(swing_lows, tolerance), key=lambda x: -x[1])[:n_levels]
+    if not resistance_levels and not support_levels:
+        return 0.0, 0.0
+
+    above = [(lvl, cnt) for lvl, cnt in resistance_levels if lvl > current]
+    below = [(lvl, cnt) for lvl, cnt in support_levels if lvl < current]
+    all_counts = [c for _, c in (resistance_levels + support_levels)] or [1]
+    max_strength = max(all_counts)
+
+    signal = 0.0
+    nearest_dist = None
+
+    if above:
+        lvl, cnt = min(above, key=lambda x: x[0] - current)
+        dist = (lvl - current) / (vol_proxy * 10 + 1e-9)
+        proximity = max(0.0, 1.0 - dist)
+        signal += -proximity * (cnt / max_strength)
+        nearest_dist = dist
+
+    if below:
+        lvl, cnt = max(below, key=lambda x: x[0])
+        dist = (current - lvl) / (vol_proxy * 10 + 1e-9)
+        proximity = max(0.0, 1.0 - dist)
+        signal += proximity * (cnt / max_strength)
+        nearest_dist = dist if nearest_dist is None else min(nearest_dist, dist)
+
+    # Genuine breakout check -- price beyond ALL known resistance/support,
+    # not just "the nearest level happens to now sit on the other side"
+    # (that's the ordinary above/below case above, not a breakout). Added
+    # as a continuation BONUS on top of the proximity terms rather than
+    # trying to flip them in place -- when a real breakout has happened,
+    # `above`/`below` are typically empty or reference different, more
+    # distant levels anyway, so this cleanly adds the "broken level
+    # becomes support/resistance" polarity-flip effect without the
+    # structurally-impossible in-block condition the first version of
+    # this function had (current > lvl inside a block already filtered
+    # to lvl > current can never be true).
+    if momentum_mode:
+        if resistance_levels:
+            top_lvl, top_cnt = max(resistance_levels, key=lambda x: x[0])
+            if current > top_lvl:
+                signal += 0.5 * (top_cnt / max_strength)
+        if support_levels:
+            bot_lvl, bot_cnt = min(support_levels, key=lambda x: x[0])
+            if current < bot_lvl:
+                signal -= 0.5 * (bot_cnt / max_strength)
+
+    return float(nearest_dist if nearest_dist is not None else 0.0), float(np.clip(signal, -1, 1))
+
+
+def transfer_entropy(source_returns, target_returns, lag=1, bins=5):
+    """L17: Transfer entropy from source to target. Measures whether source's
+    past directional moves provide information about target's next move,
+    beyond what target's own history provides. Returns positive value if
+    source -> target information flow exists, else near-zero.
+
+    Uses binned estimator for speed (proper KSG estimator is O(n^2)).
+    Returns a signed directional signal: positive = source predicts target
+    up, negative = source predicts target down."""
+    n = min(len(source_returns), len(target_returns)) - lag
+    if n < 30:
+        return 0.0
+    s = source_returns[-n - lag:-lag]
+    t_past   = target_returns[-n - lag:-lag]
+    t_future = target_returns[-n:]
+    try:
+        s_bin  = np.digitize(s,       np.percentile(s,       np.linspace(0, 100, bins + 1)[1:-1]))
+        tp_bin = np.digitize(t_past,  np.percentile(t_past,  np.linspace(0, 100, bins + 1)[1:-1]))
+        tf_bin = np.digitize(t_future,np.percentile(t_future,np.linspace(0, 100, bins + 1)[1:-1]))
+        # P(t_future | t_past, s) vs P(t_future | t_past)
+        joint3  = np.zeros((bins, bins, bins))
+        joint2  = np.zeros((bins, bins))
+        joint2b = np.zeros((bins, bins))
+        marg    = np.zeros(bins)
+        for i in range(n):
+            si  = min(s_bin[i],  bins - 1)
+            tpi = min(tp_bin[i], bins - 1)
+            tfi = min(tf_bin[i], bins - 1)
+            joint3[tfi, tpi, si]  += 1
+            joint2[tfi, tpi]      += 1
+            joint2b[tpi, si]      += 1
+            marg[tpi]             += 1
+        joint3  = joint3 / (n + 1e-9)
+        joint2  = joint2 / (n + 1e-9)
+        joint2b = joint2b / (n + 1e-9)
+        marg    = marg / (n + 1e-9)
+        te = 0.0
+        for tfi in range(bins):
+            for tpi in range(bins):
+                for si in range(bins):
+                    num = joint3[tfi, tpi, si]
+                    if num <= 0: continue
+                    denom_a = joint2b[tpi, si] if joint2b[tpi, si] > 0 else 1e-9
+                    denom_b = joint2[tfi, tpi] if joint2[tfi, tpi] > 0 else 1e-9
+                    base    = marg[tpi]         if marg[tpi] > 0         else 1e-9
+                    te += num * np.log((num * base) / (denom_a * denom_b) + 1e-9)
+        # directional component: if source recently moved up, does target follow?
+        src_dir = np.sign(np.mean(s[-5:]))
+        return float(np.clip(te * src_dir, -1, 1))
+    except Exception:
+        return 0.0
+
+
+def detect_jumps(returns, threshold_sigma=2.5):
+    """L18: Jump-diffusion — Merton-style jump detection. Identifies ticks
+    where the absolute return exceeds threshold_sigma standard deviations
+    (likely engineered jumps in synthetic indices). Returns:
+      jump_intensity  : recent jump frequency (0-1 normalised)
+      jump_direction  : +1 if recent jumps were up, -1 if down, 0 if mixed
+      post_jump_signal: after a large jump, expect partial reversion (-jump_dir)"""
+    if len(returns) < 30:
+        return 0.0, 0.0, 0.0
+    sigma = np.std(returns)
+    if sigma == 0:
+        return 0.0, 0.0, 0.0
+    z_scores  = returns / sigma
+    jump_mask = np.abs(z_scores) > threshold_sigma
+    recent    = jump_mask[-20:]
+    intensity = float(np.mean(recent))
+    if not np.any(recent):
+        return intensity, 0.0, 0.0
+    recent_z  = z_scores[-20:]
+    jump_dirs = np.sign(recent_z[recent])
+    jump_dir  = float(np.mean(jump_dirs)) if len(jump_dirs) > 0 else 0.0
+    # post-jump: last tick was a jump → expect partial reversion
+    post_jump = -float(np.sign(z_scores[-1])) if jump_mask[-1] else 0.0
+    return intensity, float(jump_dir), float(post_jump)
+
+
+def fit_garch(returns, scale=1000.0):
+    if len(returns) < MIN_TICKS_FOR_FIT:
+        return None
+    try:
+        scaled = returns * scale
+        am = arch_model(scaled, vol="Garch", p=1, q=1, mean="Zero", dist="normal")
+        # arch's SLSQP optimizer prints convergence diagnostics directly to
+        # stdout/stderr on non-convergence, bypassing warnings.filterwarnings.
+        # These aren't fatal (a result is still returned) but were showing up
+        # as noisy 'error' severity log lines - fully suppress at the source.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                result = am.fit(disp="off")
+        return result
+    except Exception as e:
+        print(f"[GARCH] fit failed: {e}")
+        return None
+
+
+def garch_vol_trust(garch_result, returns, scale=1000.0):
+    if garch_result is None:
+        return 0.5, None
+    try:
+        forecast = garch_result.forecast(horizon=1, reindex=False)
+        cond_vol = math.sqrt(float(forecast.variance.values[-1, 0])) / scale
+        baseline_vol = np.std(returns) if np.std(returns) > 0 else 1e-9
+        ratio = cond_vol / baseline_vol
+        trust = 1.0 / (1.0 + max(ratio - 1, 0) * 2)
+        return float(np.clip(trust, 0.1, 1.0)), cond_vol
+    except Exception:
+        return 0.5, None
+
+
+# ---------------------------------------------------------------------------
+# LAYER 8: SAMPLE ENTROPY (proper formula, not histogram Shannon entropy)
+# ---------------------------------------------------------------------------
+def sample_entropy_trust(returns, m=2, r_mult=0.2):
+    if len(returns) < 30:
+        return 0.5
+    r = r_mult * np.std(returns)
+    if r <= 0:
+        return 0.5
+    n = len(returns)
+
+    def _phi(mm):
+        x = np.array([returns[i:i + mm] for i in range(n - mm + 1)])
+        count, total = 0, 0
+        for i in range(len(x)):
+            dist = np.max(np.abs(x - x[i]), axis=1)
+            count += np.sum(dist <= r) - 1
+            total += len(x) - 1
+        return count / total if total > 0 else 0.0
+
+    phi_m, phi_m1 = _phi(m), _phi(m + 1)
+    if phi_m == 0 or phi_m1 == 0:
+        return 0.5
+    sampen = -math.log(phi_m1 / phi_m)
+    return float(np.clip(1.0 / (1.0 + sampen), 0.1, 1.0))
+
+
+# ---------------------------------------------------------------------------
+# FIX v2 — NEW LAYER: PERMUTATION ENTROPY GATE
+# ---------------------------------------------------------------------------
+# Distinct from sample_entropy_trust above (which only down-weights evidence).
+# This is a hard pre-trade GATE: when the tick sequence is statistically
+# indistinguishable from random ordering, no amount of layer agreement is
+# trustworthy, and the trade should be skipped entirely rather than just
+# down-weighted. Permutation entropy (Bandt-Pompe) measures the predictability
+# of ordinal patterns in a short window of recent prices.
+PE_EMBED_DIM     = 5
+PE_THRESHOLD     = float(os.getenv("PE_THRESHOLD", "0.85"))   # FIX v3: raised 0.82 → 0.85 based on live log analysis.
+                           # R_50 was producing PE=0.824-0.847 on every scan,
+                           # generating 331 entropy skips — nearly double the
+                           # layer-gate skips (161). This is not genuine market
+                           # randomness; it's the threshold sitting inside R_50's
+                           # natural tick-structure PE range. Genuinely chaotic
+                           # windows sit at PE=0.90+. 0.85 keeps the gate
+                           # meaningful while allowing R_50's structured windows
+                           # through to the downstream confluence/ensemble checks.
+
+def permutation_entropy(prices, m=PE_EMBED_DIM):
+    """
+    Normalised permutation entropy in [0, 1].
+    0.0 = perfectly ordered/predictable sequence.
+    1.0 = maximally random ordinal pattern distribution.
+    """
+    prices = np.asarray(prices, dtype=float)
+    n = len(prices)
+    if n < m * 3:
+        return 1.0   # not enough data -> treat as untrustworthy (high entropy)
+
+    from math import factorial
+    counts = {}
+    for i in range(n - m + 1):
+        pattern = tuple(np.argsort(prices[i:i + m]))
+        counts[pattern] = counts.get(pattern, 0) + 1
+
+    total = sum(counts.values())
+    probs = np.array([v / total for v in counts.values()])
+    H     = -float(np.sum(probs * np.log2(probs + 1e-12)))
+    H_max = float(np.log2(factorial(m)))
+    return float(np.clip(H / H_max, 0.0, 1.0))
+
+
+def entropy_gate_passes(prices, threshold=PE_THRESHOLD):
+    """
+    Returns (passes: bool, pe_score: float).
+    Uses the most recent 150 prices (or all available if fewer).
+    """
+    window = prices[-150:] if len(prices) >= 150 else prices
+    pe = permutation_entropy(window)
+    return pe < threshold, pe
+
+
+# ---------------------------------------------------------------------------
+# FIX v2 — NEW LAYER: MULTI-TIMEFRAME CONFLUENCE
+# ---------------------------------------------------------------------------
+# Computes directional agreement across three timeframes built from the SAME
+# tick stream: raw ticks (TF1), 5-tick bars (TF5), and 20-tick bars (TF20).
+# A genuine directional edge should show up at more than one timeframe
+# simultaneously; an edge visible only on raw noisy ticks is far more likely
+# to be spurious. Returns the count of timeframes agreeing with the proposed
+# direction (0-3) plus the per-TF directions for logging/diagnostics.
+MIN_TF_AGREEMENT = int(os.getenv("MIN_TF_AGREEMENT", "2"))   # require at least 2 of 3 timeframes to agree
+
+def _bar_returns(prices, bar_size):
+    """Aggregate raw prices into bar_size-tick OHLC-style closes, return log-diffs."""
+    n_bars = len(prices) // bar_size
+    if n_bars < 2:
+        return np.array([])
+    bars   = prices[:n_bars * bar_size].reshape(n_bars, bar_size)
+    closes = bars[:, -1]
+    return np.diff(np.log(np.maximum(closes, 1e-10)))
+
+
+def _tf_direction(returns_segment, lookback=10):
+    """Simple mean-of-recent-returns direction vote: +1, -1, or 0 (neutral)."""
+    if len(returns_segment) < 3:
+        return 0
+    recent = returns_segment[-lookback:]
+    m = float(np.mean(recent))
+    if abs(m) < 1e-12:
+        return 0
+    return 1 if m > 0 else -1
+
+
+def multi_timeframe_confluence(prices, proposed_direction):
+    """
+    Returns (agreement_count: int 0-3, tf_directions: dict) for logging.
+    proposed_direction: +1 (CALL) or -1 (PUT) — the direction the rest of the
+    layer stack is currently leaning toward.
+    """
+    if len(prices) < 60:
+        return 0, {"tf1": 0, "tf5": 0, "tf20": 0}
+
+    returns_tf1  = np.diff(np.log(np.maximum(prices[-100:], 1e-10)))
+    returns_tf5  = _bar_returns(prices[-250:],  5)
+    returns_tf20 = _bar_returns(prices[-600:], 20)
+
+    d1  = _tf_direction(returns_tf1,  lookback=10)
+    d5  = _tf_direction(returns_tf5,  lookback=8)
+    d20 = _tf_direction(returns_tf20, lookback=5)
+
+    agreement = sum(1 for d in (d1, d5, d20) if d != 0 and d == proposed_direction)
+    return agreement, {"tf1": d1, "tf5": d5, "tf20": d20}
+
+
+# ---------------------------------------------------------------------------
+# LAYER 9: KALMAN FILTER (real 2-state local-level + trend filter)
+# ---------------------------------------------------------------------------
+def kalman_trend_filter(prices, q_level=1e-5, q_trend=1e-6, r_obs=0.01):
+    if len(prices) < 5:
+        return 0.0
+    F = np.array([[1.0, 1.0], [0.0, 1.0]])
+    H = np.array([[1.0, 0.0]])
+    Q = np.array([[q_level, 0.0], [0.0, q_trend]])
+    R = np.array([[r_obs]])
+    x = np.array([[prices[0]], [0.0]])
+    P = np.eye(2)
+    for price in prices[1:]:
+        x = F @ x
+        P = F @ P @ F.T + Q
+        y = price - (H @ x)[0, 0]
+        S = (H @ P @ H.T + R)[0, 0]
+        K = (P @ H.T) / S
+        x = x + K * y
+        P = (np.eye(2) - K @ H) @ P
+    trend = x[1, 0]
+    denom = np.std(prices) + 1e-9
+    return float(np.clip(np.sign(trend) * min(abs(trend) / denom * 10, 1.0), -1, 1))
+
+
+# ---------------------------------------------------------------------------
+# LAYER 10: COPULA (real Gaussian copula via rank-normal transform)
+# ---------------------------------------------------------------------------
+def copula_agreement(symbol, returns_window_dict):
+    symbols = list(returns_window_dict.keys())
+    if symbol not in symbols or len(symbols) < 2:
+        return 0.5
+    min_len = min(len(v) for v in returns_window_dict.values())
+    if min_len < 30:
+        return 0.5
+    data = np.array([returns_window_dict[s][-min_len:] for s in symbols]).T
+    ranks = np.apply_along_axis(rankdata, 0, data) / (min_len + 1)
+    normal_scores = norm.ppf(np.clip(ranks, 1e-4, 1 - 1e-4))
+    corr = np.corrcoef(normal_scores.T)
+    idx = symbols.index(symbol)
+    target_sign = np.sign(normal_scores[-1, idx])
+    weighted_agree, total_weight = 0.0, 0.0
+    for j in range(len(symbols)):
+        if j == idx:
+            continue
+        rho = abs(corr[idx, j])
+        peer_sign = np.sign(normal_scores[-1, j])
+        weighted_agree += rho * (1.0 if peer_sign == target_sign else 0.0)
+        total_weight += rho
+    if total_weight == 0:
+        return 0.5
+    return float(np.clip(weighted_agree / total_weight, 0, 1))
+
+
+# ---------------------------------------------------------------------------
+# MODEL FITTING ORCHESTRATOR (runs only during calibration)
+# ---------------------------------------------------------------------------
+def fit_minute_models_for_symbol(sd, min_bars: int = 90) -> Optional["SymbolModels"]:
+    """v9: fits HMM/GARCH/OU/Hawkes on this symbol's MINUTE bars instead of
+    raw ticks, via the MinuteBarView adapter -- reuses fit_symbol_models()
+    completely unmodified (see that adapter's docstring for why that's
+    safe). Returns None (not an exception) if there aren't enough minute
+    bars buffered yet -- the bot's own in-memory tick buffer bounds how
+    much minute history is available (unlike risefall-trainer, which has
+    a persistent Supabase archive); callers treat None as "no minute
+    model this cycle, fall back to tick" everywhere, same as an absent
+    model_cache entry already does today."""
+    mv = MinuteBarView(sd)
+    if not mv.has_data(min_bars):
+        return None
+    models = fit_symbol_models(mv)
+    return models if models.fitted else None
+
+
+def fit_symbol_models(sd) -> SymbolModels:
+    models = SymbolModels()
+    returns = sd.returns()
+    prices = sd.prices()
+    if len(returns) < MIN_TICKS_FOR_FIT:
+        return models
+
+    # use the actual measured mean inter-tick gap as dt so OU theta is in
+    # real seconds regardless of whether this is a 1HZ (dt~1s) or R_ (dt~2s) symbol
+    actual_dt = sd.mean_tick_dt()
+    models.tick_dt = actual_dt
+
+    models.hmm_model = fit_hmm(returns)
+    models.garch_result = fit_garch(returns, scale=models.garch_scale)
+    models.ou_params = fit_ou(prices, dt=actual_dt)
+    origin, h_up, up_ev, h_down, down_ev = fit_symbol_hawkes(sd)
+    models.origin_epoch = origin if origin is not None else sd.epochs()[0]
+    models.hawkes_up, models.hawkes_up_events = h_up, up_ev
+    models.hawkes_down, models.hawkes_down_events = h_down, down_ev
+
+    models.fitted_at = time.time()
+    models.fitted = True
+    return models
+
+
+# ---------------------------------------------------------------------------
+# LAYER 11: BAYESIAN FUSION (log-odds evidence combination - owns final direction)
+# ---------------------------------------------------------------------------
+def compute_features(sd, models, returns_window_dict):
+    """Evaluates all 18 layers (17 pre-existing + Support/Resistance, v10)
+    using the CACHED fitted models. Returns None if
+    no model has been fitted yet (symbol not tradable until first calibration)."""
+    if models is None or not models.fitted:
+        return None
+    returns = sd.returns()
+    prices  = sd.prices()
+    if len(returns) < MIN_TICKS_LIVE:
+        return None
+
+    recent_returns = returns[-50:] if len(returns) >= 50 else returns
+
+    # ── Fitted-model layers (L01-L12) ──────────────────────────────────────
+    trend_weight, hmm_lean = hmm_trend_weight(models.hmm_model, recent_returns)
+    vol_trust, cond_vol    = garch_vol_trust(models.garch_result, returns, models.garch_scale)
+    ou                     = ou_reversion_signal(prices, models.ou_params)
+
+    current_t  = float(sd.epochs()[-1] - models.origin_epoch)
+    lam_up     = hawkes_intensity_now(models.hawkes_up,   models.hawkes_up_events,   current_t)
+    lam_down   = hawkes_intensity_now(models.hawkes_down, models.hawkes_down_events, current_t)
+    hawkes_sig = (lam_up - lam_down) / (lam_up + lam_down + 1e-9)
+
+    h          = hurst_rs(prices)
+    arfima     = arfima_bias(returns, h)
+    markov_p   = markov_directional_prob(returns)
+    kalman     = kalman_trend_filter(prices)
+    ent_trust  = sample_entropy_trust(returns[-150:] if len(returns) >= 150 else returns)
+    copula     = copula_agreement(sd.symbol, returns_window_dict)
+
+    # Regime classification: combine HMM trend_weight + Hurst exponent.
+    # Both must agree that the market is trending before momentum mode activates.
+    #   momentum_mode=True  → RSI/StochRSI/Boll/Z-score FOLLOW the direction
+    #   momentum_mode=False → classic mean-reversion: fade overbought/oversold
+    # FIX v2: Raise h threshold from 0.52 to 0.58.
+    # True random walks (Deriv synthetics) have H≈0.50±0.05 on returns. The
+    # original 0.52 threshold was inside the noise band, meaning any slight
+    # upward bias in the H estimate triggered full momentum mode — permanently,
+    # because the old hurst_rs on prices gave H=1.0 always. After fixing
+    # hurst_rs to use returns, H will now fluctuate 0.43–0.57 on genuine
+    # random-walk synthetics. Only clearly trending regimes (H > 0.58) should
+    # activate momentum mode.
+    momentum_mode = bool(trend_weight > 0.60 and h > 0.58)
+
+    _,    rsi_signal   = compute_rsi(prices, momentum_mode=momentum_mode)
+    _,    srsi_signal  = compute_stoch_rsi(prices, momentum_mode=momentum_mode)
+    adx_val, adx_trend, adx_dir = compute_adx(prices)
+    _,    boll_signal  = compute_bollinger(prices, momentum_mode=momentum_mode)
+    z_val, z_signal    = compute_zscore(prices, momentum_mode=momentum_mode)
+    sr_dist, sr_signal = compute_support_resistance(prices, momentum_mode=momentum_mode)
+
+    # transfer entropy: average signal from all OTHER symbols toward this one
+    te_signal = 0.0
+    others = {s: r for s, r in returns_window_dict.items() if s != sd.symbol}
+    if others:
+        te_vals = [transfer_entropy(src_r, returns[-200:] if len(returns) >= 200 else returns)
+                   for src_r in others.values()]
+        te_signal = float(np.mean(te_vals))
+
+    jump_intensity, jump_dir, post_jump = detect_jumps(returns)
+
+    # Hurst-derived arbiter: how much to trust momentum vs reversion layers
+    # H > 0.5 → persistent (trust momentum), H < 0.5 → anti-persistent (trust reversion)
+    # Expressed as a centred signal so it contributes its own log-odds term
+    hurst_signal = float(np.clip((h - 0.5) * 4, -1, 1))   # +1 at H=0.75, -1 at H=0.25
+    # FIX: Hurst says HOW the market moves (persistent vs mean-reverting), not
+    # WHICH WAY. Used raw, it was a standing vote for Rise (up 89% of the time in
+    # a 60-day replay) and the strongest voter in the trending regime, so almost
+    # no Fall trade could qualify. Give it a direction: persistent -> continue
+    # the recent move, anti-persistent -> fade it.
+    _recent_dir = float(np.sign(np.sum(returns[-20:]))) if len(returns) >= 20 else 0.0
+    hurst_signal = hurst_signal * _recent_dir
+
+    # ── Layer agreement pre-computation ──────────────────────────────────
+    # Compute agree/disagree counts here (not just in explain_signal) so the
+    # main loop can enforce the MIN_LAYER_AGREE / MAX_LAYER_DISAGREE gates
+    # before committing to a trade. direction is unknown at this point, so we
+    # compute counts for both sides and let the caller choose the right set.
+    _layer_votes = [
+        (markov_p - 0.5) * 2,          # Markov
+        hmm_lean,                        # HMM
+        hawkes_sig,                      # Hawkes
+        ou["reversion_dir"] * ou["strength"],  # OU
+        hurst_signal,                    # Hurst
+        arfima,                          # ARFIMA
+        kalman,                          # Kalman
+        (copula - 0.5) * 2,             # Copula
+        rsi_signal,                      # RSI
+        srsi_signal,                     # StochRSI
+        adx_dir * adx_trend,            # ADX
+        boll_signal,                     # Bollinger
+        z_signal,                        # Z-score
+        te_signal,                       # Transfer entropy
+        jump_dir * jump_intensity,       # Jump direction
+        post_jump * jump_intensity,      # Post-jump reversion
+        sr_signal,                        # Support/Resistance (v10, new)
+    ]
+    # agree_up / disagree_up: counts from the perspective of a CALL trade
+    _agree_up    = sum(1 for v in _layer_votes if v > 0)
+    _disagree_up = sum(1 for v in _layer_votes if v < 0)
+    _neutral     = len(_layer_votes) - _agree_up - _disagree_up
+
+    return {
+        # fitted-model layers
+        "markov_p":     markov_p,
+        "hmm_lean":     hmm_lean,
+        "trend_weight": trend_weight,
+        "hawkes":       hawkes_sig,
+        "ou_dir":       ou["reversion_dir"],
+        "ou_strength":  ou["strength"],
+        "hurst":        h,
+        "hurst_signal": hurst_signal,
+        "arfima_bias":  arfima,
+        "vol_trust":    vol_trust,
+        "entropy_trust":ent_trust,
+        "kalman":       kalman,
+        "copula_agree": copula,
+        "cond_vol":     cond_vol,
+        "ou_params":    models.ou_params,
+        # confirmation layers
+        "rsi_signal":    rsi_signal,
+        "srsi_signal":   srsi_signal,
+        "adx_val":       adx_val,
+        "adx_trend":     adx_trend,
+        "adx_dir":       adx_dir,
+        "boll_signal":   boll_signal,
+        "z_signal":      z_signal,
+        "z_val":         z_val,
+        "te_signal":     te_signal,
+        "momentum_mode": momentum_mode,   # logged to trade journal for analysis
+        "jump_intensity": jump_intensity,
+        "jump_dir":     jump_dir,
+        "post_jump":    post_jump,
+        "sr_signal":    sr_signal,          # Support/Resistance (v10, new)
+        "sr_dist":      sr_dist,            # distance to nearest level, in volatility units
+        # pass through for calibration weight lookup
+        "per_layer_weights": models.per_layer_weights,
+        # layer vote counts (direction-agnostic: agree_up = votes for CALL)
+        "agree_up":    _agree_up,
+        "disagree_up": _disagree_up,
+        "n_neutral":   _neutral,
+        "n_layers":    len(_layer_votes),
+        # Raw signed per-layer votes, in the exact order of LAYER_NAMES in
+        # regime_conviction.py. Needed by the regime router so it can select
+        # a subset of layers rather than consuming the already-averaged
+        # p_up. Keep this list and that one in sync if layers change.
+        "layer_votes": list(_layer_votes),
+    }
+
+
+
+# =============================================================================
+# v3 UPGRADE 1 — DRIFT DETECTION (KS + PSI + CUSUM)
+# =============================================================================
+class DriftDetector:
+    """
+    Three independent drift detectors running on every symbol's live stream.
+
+    KS-test:  Compares the distribution of the last 200 live log-returns
+              against the training window snapshot. A significant shift
+              (p < KS_P_THRESHOLD) means the data-generating process has
+              changed and the fitted GARCH/HMM/OU parameters are stale.
+
+    PSI:      Population Stability Index on confidence scores. Measures
+              whether the model's output distribution has shifted vs. its
+              calibration-time distribution. PSI > 0.20 = major shift.
+              PSI = Σ (actual% - expected%) × ln(actual%/expected%)
+
+    CUSUM:    Cumulative sum of (0.5 - win_indicator) detects sustained
+              below-50% win rate sequences faster than a rolling average.
+              Resets to 0 after recalibration. Threshold = 4.0 (roughly
+              equivalent to 8-10 consecutive losses from a 50% baseline).
+
+    Any single detector firing sets drift_degraded[symbol] = True, which:
+      1. Reduces that symbol's stake to 50% of normal immediately
+      2. Triggers a recalibration request within the next main-loop cycle
+      3. Clears when the recalibration completes and detectors reset
+    """
+
+    @staticmethod
+    def check_ks(state: "TradeState", symbol: str,
+                 live_returns: np.ndarray) -> bool:
+        ref = state.drift_reference_returns.get(symbol)
+        if ref is None or len(ref) < 50 or len(live_returns) < 50:
+            return False
+        live_r = live_returns[-200:] if len(live_returns) > 200 else live_returns
+        _, pval = ks_2samp(ref, live_r)
+        fired = pval < KS_P_THRESHOLD
+        if fired:
+            print(f"[Drift/KS] {symbol}: p={pval:.4f} < {KS_P_THRESHOLD} "
+                  f"— return distribution shifted")
+        return fired
+
+    @staticmethod
+    def _psi(expected: np.ndarray, actual: np.ndarray, n_bins: int = 10) -> float:
+        bins = np.percentile(expected, np.linspace(0, 100, n_bins + 1))
+        bins[0]  -= 1e-9
+        bins[-1] += 1e-9
+        exp_counts = np.histogram(expected, bins=bins)[0] + 1
+        act_counts = np.histogram(actual,   bins=bins)[0] + 1
+        exp_pct = exp_counts / exp_counts.sum()
+        act_pct = act_counts / act_counts.sum()
+        return float(np.sum((act_pct - exp_pct) * np.log(act_pct / exp_pct)))
+
+    @staticmethod
+    def check_psi(state: "TradeState", symbol: str,
+                  live_confidence: float) -> bool:
+        hist = state.drift_confidence_history[symbol]
+        hist.append(live_confidence)
+        if len(hist) < 100:
+            return False
+        ref = state.drift_reference_returns.get(f"conf_{symbol}")
+        if ref is None or len(ref) < 50:
+            return False
+        psi = DriftDetector._psi(ref, np.array(hist))
+        fired = psi > PSI_THRESHOLD
+        if fired:
+            print(f"[Drift/PSI] {symbol}: PSI={psi:.3f} > {PSI_THRESHOLD} "
+                  f"— confidence distribution shifted")
+        return fired
+
+    @staticmethod
+    def update_cusum(state: "TradeState", symbol: str, won: bool) -> bool:
+        outcome = 1.0 if won else 0.0
+        state.cusum_stat[symbol] = max(
+            0.0,
+            state.cusum_stat[symbol] + (0.5 - CUSUM_DRIFT) - outcome
+        )
+        fired = state.cusum_stat[symbol] > CUSUM_THRESHOLD
+        if fired:
+            print(f"[Drift/CUSUM] {symbol}: stat={state.cusum_stat[symbol]:.2f} "
+                  f"> {CUSUM_THRESHOLD} — sustained win-rate degradation")
+        return fired
+
+    @staticmethod
+    def snapshot_reference(state: "TradeState", symbol: str,
+                           returns: np.ndarray, confidences: List[float]):
+        """Call after each calibration to reset the reference distributions."""
+        state.drift_reference_returns[symbol]          = returns[-500:].copy()
+        state.drift_reference_returns[f"conf_{symbol}"] = np.array(confidences[-200:])
+        state.cusum_stat[symbol]   = 0.0
+        state.drift_degraded[symbol] = False
+        # BUGFIX: this used to leave state.drift_confidence_history[symbol]
+        # untouched. check_psi() only requires len(hist) >= 100 before it
+        # starts comparing -- with the deque never cleared, that minimum was
+        # already satisfied by up to 200 STALE readings carried over from
+        # before this calibration (including the very readings that caused
+        # the drift trigger). The result: the first live PSI check after a
+        # fresh recalibration was comparing the new reference against old,
+        # already-known-to-be-shifted data -- confirmed in production logs
+        # where PSI read "shifted" within microseconds of "complete in",
+        # with zero live samples collected since. That produced a
+        # self-perpetuating lock: recalibrate -> instantly re-fail against
+        # stale history -> recalibrate again ~5min later, trading unlocked
+        # only in the gap. Clearing the deque here means check_psi() has to
+        # accumulate 100 genuinely NEW post-calibration readings before it
+        # can fire again, so drift is measured against what's actually
+        # happening now.
+        state.drift_confidence_history[symbol].clear()
+        # v15: reset the consecutive-fire streak too, for the same reason
+        # the deque above gets cleared -- otherwise a streak already at or
+        # near DRIFT_CONSECUTIVE_REQUIRED from just before this calibration
+        # could latch again almost immediately on the first post-cal check.
+        state.drift_consecutive_fires[symbol] = 0
+        print(f"[Drift] {symbol}: reference snapshot saved "
+              f"({len(returns[-500:])} returns, {len(confidences[-200:])} conf scores)")
+
+    @staticmethod
+    def check_all(state: "TradeState", symbol: str,
+                  live_returns: np.ndarray, live_confidence: float) -> bool:
+        """Run all three detectors. Returns True if drift is SUSTAINED.
+
+        v15 BUGFIX: this used to latch drift_degraded[symbol]=True on the
+        FIRST fire of KS or PSI and never re-check it until the next full
+        calibration cleared it. check_calibration_triggers() polls every
+        2s for ~5 minutes of unlocked time between calibrations, across 8
+        symbols each getting hundreds of independent check opportunities --
+        with a one-shot latch and no decay, it becomes almost inevitable
+        that every symbol accumulates at least one blip before the next
+        trigger, regardless of whether anything is actually, persistently
+        wrong. Confirmed in production: every recalibration after the first
+        listed all 8 symbols by name. Requiring DRIFT_CONSECUTIVE_REQUIRED
+        fires in a row (with any non-fire resetting the streak) means a
+        single noisy read can't lock a symbol out for the next ~20+ minutes
+        of calibration -- only a signal that keeps showing up can.
+        """
+        ks_fired  = DriftDetector.check_ks(state, symbol, live_returns)
+        psi_fired = DriftDetector.check_psi(state, symbol, live_confidence)
+        # CUSUM is updated only on trade outcomes (see update_cusum) and
+        # already requires a sustained run below zero to fire on its own
+        # accumulator, so it isn't run through this same streak counter --
+        # doing so would double-require persistence on top of persistence.
+        if ks_fired or psi_fired:
+            state.drift_consecutive_fires[symbol] += 1
+        else:
+            state.drift_consecutive_fires[symbol] = 0
+
+        if (state.drift_consecutive_fires[symbol] >= DRIFT_CONSECUTIVE_REQUIRED
+                and not state.drift_degraded[symbol]):
+            state.drift_degraded[symbol] = True
+            print(f"[Drift] {symbol}: DEGRADED after "
+                  f"{state.drift_consecutive_fires[symbol]} consecutive fires — "
+                  f"stake reduced to {DRIFT_STAKE_REDUCTION:.0%} until recalibration")
+        return state.drift_degraded[symbol]
+
+
+# =============================================================================
+# v3 UPGRADE 2 — META-LEARNER FUSION
+# =============================================================================
+class MetaLearner:
+    """
+    Logistic regression meta-model that learns from OOS layer outputs → outcomes.
+
+    Input:  16-dimensional vector of layer signal values (same order as
+            online_update_layer_weights uses: markov, hmm, hawkes, ...)
+    Output: P(direction=+1) in [0, 1]
+    Training: online SGD with L2 regularisation after every step-0 trade.
+
+    Falls back to bayesian_fusion() transparently when fewer than
+    META_MIN_SAMPLES training examples exist for the symbol.
+
+    Architecture note: the meta-learner weights are stored in TradeState
+    (not SymbolModels) because they require live trade outcomes to train,
+    which only become available after the model is already deployed —
+    unlike the GARCH/HMM parameters which are fitted on tick history.
+    """
+
+    LAYER_KEYS = [
+        "markov", "hmm", "hawkes", "ou", "hurst", "arfima",
+        "kalman", "copula", "rsi", "srsi", "adx", "boll",
+        "zscore", "te", "jump", "post_jump"
+    ]
+    N_FEATURES = len(LAYER_KEYS)
+
+    @staticmethod
+    def feats_to_vector(feats: dict) -> np.ndarray:
+        """Extract the standardised 16-dim layer signal vector from a feats dict."""
+        v = np.array([
+            (feats.get("markov_p",    0.5) - 0.5) * 2,
+            feats.get("hmm_lean",      0.0),
+            feats.get("hawkes",        0.0),
+            feats.get("ou_dir",        0.0) * feats.get("ou_strength", 0.0),
+            feats.get("hurst_signal",  0.0),
+            feats.get("arfima_bias",   0.0),
+            feats.get("kalman",        0.0),
+            (feats.get("copula_agree", 0.5) - 0.5) * 2,
+            feats.get("rsi_signal",    0.0),
+            feats.get("srsi_signal",   0.0),
+            feats.get("adx_dir",       0.0) * feats.get("adx_trend", 0.0),
+            feats.get("boll_signal",   0.0),
+            feats.get("z_signal",      0.0),
+            feats.get("te_signal",     0.0),
+            feats.get("jump_dir",      0.0) * feats.get("jump_intensity", 0.0),
+            feats.get("post_jump",     0.0) * feats.get("jump_intensity", 0.0),
+        ], dtype=float)
+        return np.clip(v, -3.0, 3.0)
+
+    @staticmethod
+    def predict(state: "TradeState", symbol: str, x: np.ndarray) -> Optional[float]:
+        """
+        Returns P(up) from the meta-model, or None if not enough training data.
+        None signals the caller to fall back to bayesian_fusion().
+        """
+        w = state.meta_weights.get(symbol)
+        b = state.meta_bias.get(symbol, 0.0)
+        buf = state.meta_buffer[symbol]
+        if w is None or len(buf) < META_MIN_SAMPLES:
+            return None
+        return float(sigmoid(np.dot(w, x) + b))
+
+    @staticmethod
+    def update(state: "TradeState", symbol: str,
+               x: np.ndarray, direction: int, won: bool):
+        """
+        Online SGD step after a resolved step-0 trade.
+        Label: 1 if direction=+1 and won, or direction=-1 and lost (i.e. market went UP).
+        """
+        # Ground truth: did price go up? WIN on CALL or LOSS on PUT → went up
+        y = 1.0 if (direction == 1 and won) or (direction == -1 and not won) else 0.0
+
+        # Store example
+        state.meta_buffer[symbol].append((x.copy(), y))
+        buf = state.meta_buffer[symbol]
+
+        # Initialise weights if first example
+        if symbol not in state.meta_weights:
+            state.meta_weights[symbol] = np.zeros(MetaLearner.N_FEATURES)
+            state.meta_bias[symbol]    = 0.0
+
+        if len(buf) < META_MIN_SAMPLES:
+            return   # not enough data yet to do meaningful SGD
+
+        w = state.meta_weights[symbol]
+        b = state.meta_bias[symbol]
+        p = float(sigmoid(np.dot(w, x) + b))
+        err = p - y   # prediction error
+
+        # Gradient step with L2 regularisation
+        grad_w = err * x + META_L2 * w
+        grad_b = err
+        state.meta_weights[symbol] = w - META_LEARNING_RATE * grad_w
+        state.meta_bias[symbol]    = b - META_LEARNING_RATE * grad_b
+
+    @staticmethod
+    def retrain_from_buffer(state: "TradeState", symbol: str):
+        """
+        Full batch retrain from the rolling buffer after each calibration.
+        Uses mini-batch gradient descent (50 epochs) to avoid cold-start lag
+        after a recalibration resets the model.
+        """
+        buf = list(state.meta_buffer[symbol])
+        if len(buf) < META_MIN_SAMPLES:
+            return
+        X = np.array([x for x, _ in buf])
+        y = np.array([lbl for _, lbl in buf])
+        w = state.meta_weights.get(symbol, np.zeros(MetaLearner.N_FEATURES))
+        b = state.meta_bias.get(symbol, 0.0)
+
+        lr = META_LEARNING_RATE * 0.3   # lower LR for batch to avoid oscillation
+        for _ in range(50):
+            preds = sigmoid(X @ w + b)
+            errs  = preds - y
+            w     = w - lr * (X.T @ errs / len(y) + META_L2 * w)
+            b     = b - lr * np.mean(errs)
+
+        state.meta_weights[symbol] = w
+        state.meta_bias[symbol]    = float(b)
+        print(f"[MetaLearner] {symbol}: batch retrained on {len(buf)} examples")
+
+
+# =============================================================================
+# v3 UPGRADE 3 — CONFIDENCE CALIBRATION
+# =============================================================================
+class ConfidenceCalibrator:
+    """
+    Post-hoc calibration of raw model confidence scores so that stated
+    confidence closely matches empirical win rates.
+
+    Two methods, selected by data availability:
+    1. Temperature scaling: single-parameter T divides the log-odds of p_up.
+       p_calibrated = sigmoid(log_odds(p_up) / T)
+       T > 1 softens (reduces overconfidence), T < 1 sharpens.
+       Fits T by minimising negative log-likelihood on OOS data.
+       Preferred when n_samples >= 50.
+
+    2. Isotonic regression (fallback): monotonic mapping from raw confidence
+       to empirical win rate in equal-frequency bins. No parametric assumption.
+       Used when temperature fit has high residual or data is limited.
+
+    After calibration, Kelly sizing uses calibrated_confidence → real expected
+    win rate rather than the raw overconfident estimate.
+    """
+
+    @staticmethod
+    def fit_temperature(confidences: np.ndarray, outcomes: np.ndarray) -> float:
+        """
+        Fit temperature T that minimises NLL(outcomes | sigmoid(logit(conf)/T)).
+        confidences: raw p_up values in (0,1)
+        outcomes: 1 = price actually went up, 0 = it went down. NOT "was the
+            prediction correct" -- that label is symmetric/direction-blind
+            (a good PUT call and a good CALL call would both score 1), and
+            feeding it into a calibrator whose output gets used as a
+            directional P(up) silently biases the bot toward whichever
+            side historically won more. See expanding_window_walk_forward()
+            for the full writeup of this bug and its fix.
+        Returns T (positive float). T=1.0 means no calibration needed.
+        """
+        if len(confidences) < 50:
+            return 1.0
+        # logit of raw confidence
+        p = np.clip(confidences, 0.01, 0.99)
+        logits = np.log(p / (1 - p))
+        y = outcomes.astype(float)
+
+        def nll(T):
+            T = max(T[0], 0.1)
+            p_cal = sigmoid(logits / T)
+            return -float(np.mean(y * np.log(p_cal + 1e-9) +
+                                  (1-y) * np.log(1 - p_cal + 1e-9)))
+
+        res = minimize(nll, x0=[1.0], method="Nelder-Mead",
+                       options={"xatol": 1e-4, "maxiter": 200})
+        T = float(max(res.x[0], 0.1))
+        print(f"[Calibrate] Temperature T={T:.3f} "
+              f"({'soften' if T>1.1 else 'sharpen' if T<0.9 else 'neutral'})")
+        return T
+
+    @staticmethod
+    def fit_isotonic(confidences: np.ndarray,
+                     outcomes: np.ndarray, n_bins: int = 10) -> Optional[tuple]:
+        """
+        Fit a piecewise-monotonic mapping in n_bins equal-frequency bins.
+        confidences: raw p_up values in (0,1); outcomes: 1 = price actually
+            went up, 0 = it went down (see fit_temperature()'s docstring --
+            this must be direction-symmetric with what p_up means, not
+            "was the prediction correct", or the resulting bin_win_rates
+            are win rates, not P(up) estimates, and calibrate() below ends
+            up blending a win rate into a directional probability).
+        Returns (bin_edges, bin_win_rates) tuple or None if insufficient data.
+        """
+        if len(confidences) < 50:
+            return None
+        idx  = np.argsort(confidences)
+        c    = confidences[idx]
+        y    = outcomes[idx].astype(float)
+        edges, rates = [], []
+        for i in range(n_bins):
+            lo = i * len(c) // n_bins
+            hi = (i+1) * len(c) // n_bins
+            edges.append(float(c[lo]))
+            rates.append(float(np.mean(y[lo:hi])) if hi > lo else 0.5)
+        edges.append(float(c[-1]) + 1e-6)
+        # Enforce monotonicity with pool-adjacent-violators
+        for i in range(1, len(rates)):
+            if rates[i] < rates[i-1]:
+                merged = (rates[i-1] + rates[i]) / 2
+                rates[i-1] = rates[i] = merged
+        return (np.array(edges), np.array(rates))
+
+    @staticmethod
+    def calibrate(p_up: float, state: "TradeState", symbol: str) -> float:
+        """
+        Apply temperature scaling (primary) then isotonic clamp (secondary).
+        Returns calibrated probability in (0.01, 0.99).
+        """
+        T = state.cal_temperature.get(symbol, 1.0)
+        # Temperature scaling
+        logit = math.log(max(p_up, 0.01) / max(1 - p_up, 0.01))
+        p_cal = float(sigmoid(logit / T))
+
+        # Isotonic clamp (if fitted)
+        iso = state.cal_isotonic.get(symbol)
+        if iso is not None:
+            edges, rates = iso
+            idx = np.searchsorted(edges, p_cal, side="right") - 1
+            idx = int(np.clip(idx, 0, len(rates) - 1))
+            # Blend: 70% isotonic, 30% temperature-scaled
+            p_cal = 0.70 * rates[idx] + 0.30 * p_cal
+
+        return float(np.clip(p_cal, 0.01, 0.99))
+
+    @staticmethod
+    def fit_and_save(state: "TradeState", symbol: str,
+                     raw_p_ups: List[float], outcomes: List[float]):
+        """Fit temperature + isotonic calibrators from OOS prediction history.
+        outcomes must be "did price actually go up" (1/0), not "was the
+        prediction correct" -- see fit_temperature()'s docstring."""
+        if len(raw_p_ups) < 50:
+            return
+        conf  = np.array(raw_p_ups)
+        y     = np.array(outcomes)
+        T     = ConfidenceCalibrator.fit_temperature(conf, y)
+        iso   = ConfidenceCalibrator.fit_isotonic(conf, y)
+        state.cal_temperature[symbol] = T
+        state.cal_isotonic[symbol]    = iso
+
+
+# =============================================================================
+# v3 UPGRADE 5 — PORTFOLIO RISK ALLOCATOR
+# =============================================================================
+class PortfolioAllocator:
+    """
+    Replaces best-signal-wins with simultaneous multi-symbol capital allocation.
+
+    Algorithm:
+      1. Score all symbols by (calibrated_p_up, confidence, reliability).
+      2. Estimate pairwise return correlations from recent tick history.
+      3. Assign each symbol a base Kelly fraction from its calibrated edge.
+      4. Apply correlation penalty: if two symbols have corr > PORTFOLIO_HIGH_CORR,
+         reduce both stakes by (1 - corr) so their combined risk ≤ single-symbol risk.
+      5. Scale stakes so total risk ≤ PORTFOLIO_MAX_TOTAL_RISK × balance.
+      6. Return a list of (symbol, direction, stake, duration) for simultaneous execution.
+
+    Max PORTFOLIO_MAX_CONCURRENT positions open at once.
+    Symbols already in open_positions are excluded from new allocation.
+    """
+
+    @staticmethod
+    def estimate_correlations(symbol_data: dict,
+                              symbols: List[str],
+                              window: int = PORTFOLIO_CORR_WINDOW) -> Dict:
+        corr_map = {}
+        ret_map  = {}
+        for s in symbols:
+            r = symbol_data[s].returns()
+            ret_map[s] = r[-window:] if len(r) >= window else r
+        for i, a in enumerate(symbols):
+            for b in symbols[i+1:]:
+                ra, rb = ret_map[a], ret_map[b]
+                n = min(len(ra), len(rb))
+                if n < 50:
+                    corr_map[(a,b)] = corr_map[(b,a)] = 0.0
+                    continue
+                c = float(np.corrcoef(ra[-n:], rb[-n:])[0, 1])
+                corr_map[(a,b)] = corr_map[(b,a)] = float(np.clip(c, -1, 1))
+        return corr_map
+
+    @staticmethod
+    def allocate(candidates: List[tuple],   # (symbol, direction, p_up_cal, confidence, exp_win, duration)
+                 state: "TradeState",
+                 symbol_data: dict,
+                 balance: float) -> List[tuple]:   # [(symbol, direction, stake, duration)]
+        """
+        Returns allocations sorted by stake descending.
+        candidates must already have passed all signal gates.
+        """
+        if not candidates:
+            return []
+
+        # Exclude symbols already in open positions
+        active = set(state.open_positions.keys())
+        cands  = [c for c in candidates if c[0] not in active]
+        if not cands:
+            return []
+
+        # Cap at portfolio max
+        cands = cands[:PORTFOLIO_MAX_CONCURRENT]
+
+        # Estimate correlations
+        syms = [c[0] for c in cands]
+        corr = PortfolioAllocator.estimate_correlations(
+            symbol_data, syms)
+
+        # Base Kelly fractions
+        allocs = []
+        for sym, direction, p_cal, confidence, exp_win, duration in cands:
+            payout = float(np.mean(state.payout_history.get(sym, [0.88]) or [0.88]))
+            p      = float(np.clip(exp_win, 0.01, 0.99))
+            f_full = max(0.0, (p * payout - (1 - p)) / payout)
+            f_kel  = f_full * 0.25                       # quarter-Kelly
+            allocs.append({
+                "symbol":    sym,
+                "direction": direction,
+                "duration":  duration,
+                "f_kelly":   f_kel,
+                "confidence": confidence,
+            })
+
+        # Correlation penalty — reduce allocation for correlated pairs
+        for i in range(len(allocs)):
+            for j in range(i+1, len(allocs)):
+                a, b = allocs[i]["symbol"], allocs[j]["symbol"]
+                c = abs(corr.get((a, b), 0.0))
+                if c > PORTFOLIO_HIGH_CORR:
+                    penalty = 1.0 - (c - PORTFOLIO_HIGH_CORR) / (1 - PORTFOLIO_HIGH_CORR)
+                    allocs[i]["f_kelly"] *= penalty
+                    allocs[j]["f_kelly"] *= penalty
+                    print(f"[Portfolio] Corr({a},{b})={c:.2f} → "
+                          f"penalty={penalty:.2f} on both")
+
+        # Scale so total risk ≤ PORTFOLIO_MAX_TOTAL_RISK × balance
+        total_f = sum(a["f_kelly"] for a in allocs)
+        if total_f > PORTFOLIO_MAX_TOTAL_RISK:
+            scale = PORTFOLIO_MAX_TOTAL_RISK / total_f
+            for a in allocs:
+                a["f_kelly"] *= scale
+
+        # Convert to stakes
+        MIN_STAKE_LIVE = 0.35
+        result = []
+        for a in allocs:
+            stake = max(MIN_STAKE_LIVE, round(balance * a["f_kelly"], 2))
+            # Apply drift reduction if symbol is degraded
+            if state.drift_degraded.get(a["symbol"], False):
+                stake = max(MIN_STAKE_LIVE, round(stake * DRIFT_STAKE_REDUCTION, 2))
+            result.append((a["symbol"], a["direction"], stake, a["duration"]))
+
+        result.sort(key=lambda x: x[2], reverse=True)
+        print(f"[Portfolio] Allocating {len(result)} positions: "
+              + " | ".join(f"{s} ${stk:.2f}" for s,_,stk,_ in result))
+        return result
+
+
+def bayesian_fusion(features):
+    """Log-odds Bayesian evidence combination across all layers (17 pre-existing + Support/Resistance, v10).
+
+    WEIGHT HIERARCHY (highest to lowest precision):
+      1. Per-symbol weights learned from OOS correlation during deep calibration
+         (stored in features["per_layer_weights"]) — used when available.
+      2. Static defaults below — used as fallback for unlearned symbols.
+
+    Hurst contributes its own direct term (not just via ARFIMA) as the
+    momentum/reversion arbiter. New confirmation layers (RSI, StochRSI, ADX,
+    Bollinger, Z-score, Transfer entropy, Jump-diffusion) add incremental
+    evidence without overriding the core fitted-model signal.
+
+    trust_multiplier = vol_trust * entropy_trust gates the entire fusion:
+    high-volatility / high-entropy (near-random) conditions suppress all
+    evidence proportionally, not just individual layers."""
+
+    learned = features.get("per_layer_weights") or {}
+
+    def W(key, default):
+        """Return learned weight if available, else static default."""
+        return float(learned.get(key, default))
+
+    p_markov     = float(np.clip(features["markov_p"], 1e-3, 1 - 1e-3))
+    markov_logit = math.log(p_markov / (1 - p_markov))
+    trend_w      = features["trend_weight"]
+    hurst_w      = float(np.clip(features["hurst"], 0, 1))   # H itself as trust scalar
+
+    # ── Core fitted-model evidence ──────────────────────────────────────────
+    evidence = [
+        # (signal_scaled_to_logit_range, base_weight)
+        (markov_logit,                                          W("markov",   1.0)),
+        (features["hmm_lean"]    * 2.0,                        W("hmm",      trend_w)),
+        (features["hawkes"]      * 2.5,                        W("hawkes",   trend_w)),
+        (features["ou_dir"] * features["ou_strength"] * 2.0,  W("ou",       1 - trend_w)),
+        (features["hurst_signal"]* 1.2,                        W("hurst",    0.6)),   # ← direct Hurst term
+        (features["arfima_bias"] * 1.5,                        W("arfima",   0.55)),
+        (features["kalman"]      * 1.5,                        W("kalman",   0.65)),
+        ((features["copula_agree"] - 0.5) * 2.0,              W("copula",   0.50)),
+    ]
+
+    # ── Confirmation layers (incremental, lower base weight) ────────────────
+    adx_trust     = features["adx_trend"]
+    momentum_mode = features.get("momentum_mode", False)
+    # When both RSI + StochRSI agree → boost; when they disagree → reduce
+    rsi_agree  = 1.0 if (features["rsi_signal"] * features["srsi_signal"]) >= 0 else 0.4
+    bz_agree   = 1.0 if (features["boll_signal"] * features["z_signal"])   >= 0 else 0.4
+    # Regime confidence: how decisively HMM+Hurst agree on the regime
+    regime_conf = float(np.clip(abs(trend_w - 0.5) * 2 + abs(hurst_w - 0.5) * 2, 0, 1))
+
+    evidence += [
+        (features["rsi_signal"],                                W("rsi",      0.35) * rsi_agree * (1 + regime_conf * 0.5)),
+        (features["srsi_signal"],                               W("srsi",     0.30) * rsi_agree * (1 + regime_conf * 0.5)),
+        # ADX now produces real signal after tick-data TR fix; scale by trend strength
+        (features["adx_dir"] * adx_trust,                      W("adx",      0.40) * (0.5 + adx_trust)),
+        (features["boll_signal"],                               W("boll",     0.30) * bz_agree * (1 + regime_conf * 0.4)),
+        (features["z_signal"],                                  W("zscore",   0.30) * bz_agree * (1 + regime_conf * 0.4)),
+        (features["te_signal"],                                 W("te",       0.30)),
+        (features["jump_dir"]    * features["jump_intensity"],  W("jump",     0.25)),
+        (features["post_jump"]   * features["jump_intensity"],  W("post_jump",0.20)),
+        # Support/Resistance (v10, new) -- level-based, orthogonal to the
+        # rolling-statistic confirmation layers above. Weighted by how
+        # close price actually is to a level (sr_dist, in volatility
+        # units -- already baked into the sign/magnitude of sr_signal
+        # itself via compute_support_resistance()'s proximity decay, but
+        # reinforced here too so a level 8+ volatility-units away, which
+        # the raw signal already fades toward ~0 for, doesn't get
+        # over-weighted relative to a signal that's genuinely near 0 for
+        # OTHER reasons).
+        (features["sr_signal"],                                 W("sr", 0.30)),
+    ]
+
+    total_trust = features["vol_trust"] * features["entropy_trust"]
+    log_odds, total_weight = 0.0, 0.0
+    for log_ratio, weight in evidence:
+        w = float(weight) * total_trust
+        log_odds     += log_ratio * w
+        total_weight += abs(w)
+
+    # ── FIX v2: Direction balance correction ──────────────────────────────
+    # If recent signals are >80% one-directional it almost certainly reflects
+    # a structural layer bias rather than a genuine edge. A soft correction
+    # pushes log_odds back toward zero (capped at ±0.5 so it cannot flip a
+    # genuinely strong signal). The root-cause fix (Hurst on returns) removes
+    # the bias at source; this is a safety net against future regressions.
+    direction_ratio = float(features.get("recent_call_ratio", 0.5))
+    if direction_ratio > 0.80:
+        log_odds -= float(np.clip((direction_ratio - 0.80) * 5.0, 0.0, 0.5))
+    elif direction_ratio < 0.20:
+        log_odds += float(np.clip((0.20 - direction_ratio) * 5.0, 0.0, 0.5))
+
+    p_up       = float(np.clip(1.0 / (1.0 + math.exp(-log_odds)), 0.01, 0.99))
+    confidence = abs(p_up - 0.5) * 2.0 * total_trust
+    return p_up, confidence
+
+
+# ---------------------------------------------------------------------------
+# SELF-IMPROVEMENT: ONLINE LAYER WEIGHT UPDATE
+# Nudges each layer's fusion weight ±4% after every step-0 trade outcome.
+# Runs between calibrations so the bot adapts continuously from live results.
+#
+# Rule: won+agreed → reward (↑), won+opposed → punish (↓),
+#       lost+agreed → punish (↓), lost+opposed → reward (↑)
+# ---------------------------------------------------------------------------
+def online_update_layer_weights(models: SymbolModels, feats: dict,
+                                direction: int, won: bool, lr: float = 0.04):
+    if models is None or feats is None:
+        return
+    layer_signals = {
+        "markov":    (feats.get("markov_p",     0.5) - 0.5) * 2,
+        "hmm":        feats.get("hmm_lean",      0),
+        "hawkes":     feats.get("hawkes",         0),
+        "ou":         feats.get("ou_dir",         0) * feats.get("ou_strength", 0),
+        "hurst":      feats.get("hurst_signal",   0),
+        "arfima":     feats.get("arfima_bias",    0),
+        "kalman":     feats.get("kalman",         0),
+        "copula":    (feats.get("copula_agree",  0.5) - 0.5) * 2,
+        "rsi":        feats.get("rsi_signal",     0),
+        "srsi":       feats.get("srsi_signal",    0),
+        "adx":        feats.get("adx_dir",        0) * feats.get("adx_trend", 0),
+        "boll":       feats.get("boll_signal",    0),
+        "zscore":     feats.get("z_signal",       0),
+        "te":         feats.get("te_signal",      0),
+        "jump":       feats.get("jump_dir",       0) * feats.get("jump_intensity", 0),
+        "post_jump":  feats.get("post_jump",      0) * feats.get("jump_intensity", 0),
+    }
+    w       = dict(models.per_layer_weights or {})
+    outcome = 1 if won else -1
+    for layer, signal in layer_signals.items():
+        if abs(signal) < 0.01:
+            continue
+        agreement = 1 if signal * direction > 0 else -1
+        reward    = outcome * agreement
+        current_w = w.get(layer, 1.0)
+        w[layer]  = float(np.clip(current_w + lr * reward * abs(current_w), 0.05, 3.0))
+    models.per_layer_weights = w
+
+
+# ---------------------------------------------------------------------------
+# SELF-IMPROVEMENT: ADAPTIVE GATE CONTROLLER (v5)
+# Two mechanisms, two different jobs, sharing the same MIN_LAYER_AGREE /
+# MAX_LAYER_DISAGREE globals:
+#
+#   1. maybe_recalibrate_gate() (below) -- recalibrates from the CYCLE-level
+#      vote distribution (agree/disagree counts, sampled on every gate check
+#      regardless of pass/fail). This is what keeps the gate ACHIEVABLE given
+#      current market conditions and the current layer stack's behaviour --
+#      it targets GATE_TARGET_PASS_RATE, a real trade-frequency knob, instead
+#      of a hand-picked absolute vote count that may or may not be reachable.
+#      Runs on a timer (GATE_RECALIB_INTERVAL_SECS) plus an unconditional
+#      "starvation breaker" (GATE_STARVATION_SECS) that fires even with zero
+#      completed trades -- THIS is what makes the gate deadlock-proof; it
+#      does not wait on anything that the gate itself could be blocking.
+#
+#   2. autotune_gates() (further below) -- QUALITY control from realized
+#      step-0 win rate, once >=50 completed trades exist. Nudges +/-1 around
+#      whatever baseline (1) has established. This is the "is the edge still
+#      real" check; it should never be the ONLY mechanism moving the gate,
+#      because it requires trade volume to evaluate anything, and low trade
+#      volume is exactly the failure mode that needs fixing.
+# ---------------------------------------------------------------------------
+def record_gate_vote(state, agree: int, disagree: int, total: int):
+    """Called on every passes_layer_gate() check in the main scan loops
+    (NOT the atomic pre-fire recheck in execute_single_step -- that sample
+    would be biased toward already-passing votes). Cheap: just appends to
+    a bounded deque."""
+    state.recent_gate_votes.append((agree, disagree, total))
+
+
+def maybe_recalibrate_gate(state):
+    """Deadlock-proof percentile-based recalibration. Safe to call on every
+    gate check -- internally throttled by GATE_RECALIB_INTERVAL_SECS, except
+    for the starvation breaker which can fire early."""
+    global MIN_LAYER_AGREE, MAX_LAYER_DISAGREE
+    now = time.time()
+    starved = (now - state.last_trade_time) > GATE_STARVATION_SECS
+    due     = (now - state.last_gate_recalib_time) > GATE_RECALIB_INTERVAL_SECS
+
+    if not starved and not due:
+        return
+    if len(state.recent_gate_votes) < GATE_RECALIB_MIN_SAMPLES:
+        if starved:
+            # Starved AND not enough vote samples yet to do a proper
+            # percentile read (e.g. very early after a fresh deploy) --
+            # take one unconditional step down rather than doing nothing.
+            new_agree = max(MIN_LAYER_AGREE - 1, GATE_ABS_FLOOR_AGREE)
+            new_dis   = min(MAX_LAYER_DISAGREE + 1, GATE_ABS_CEIL_DISAGREE)
+            if (new_agree, new_dis) != (MIN_LAYER_AGREE, MAX_LAYER_DISAGREE):
+                print(f"[GateStarvation] no trade in {now - state.last_trade_time:.0f}s "
+                      f"and <{GATE_RECALIB_MIN_SAMPLES} vote samples yet -- "
+                      f"emergency step: agree {MIN_LAYER_AGREE}->{new_agree}, "
+                      f"disagree {MAX_LAYER_DISAGREE}->{new_dis}")
+                MIN_LAYER_AGREE, MAX_LAYER_DISAGREE = new_agree, new_dis
+                state.last_gate_recalib_time = now
+                if _store:
+                    _store.save_gates(MIN_LAYER_AGREE, MAX_LAYER_DISAGREE,
+                                      MIN_EXP_WIN_RATE, state.adaptive_threshold)
+        return
+
+    agree_arr    = np.array([v[0] for v in state.recent_gate_votes])
+    disagree_arr = np.array([v[1] for v in state.recent_gate_votes])
+
+    # Target: the agree-count value such that roughly GATE_TARGET_PASS_RATE
+    # of recent cycles would have cleared it. E.g. target_pass_rate=0.12 ->
+    # 88th percentile of the observed agree distribution.
+    target_agree = int(np.floor(np.percentile(agree_arr, 100 * (1 - GATE_TARGET_PASS_RATE))))
+    target_agree = int(np.clip(target_agree, GATE_ABS_FLOOR_AGREE, GATE_ABS_CEIL_AGREE))
+    # Same idea for disagree, mirrored (low percentile = value most cycles
+    # already satisfy "disagree <= X" at roughly the target pass rate).
+    target_dis = int(np.ceil(np.percentile(disagree_arr, 100 * GATE_TARGET_PASS_RATE)))
+    target_dis = int(np.clip(target_dis, GATE_ABS_FLOOR_DISAGREE, GATE_ABS_CEIL_DISAGREE))
+
+    if starved:
+        # Starvation overrides the target if the target itself would still
+        # starve the bot (e.g. market genuinely quiet right now) -- take an
+        # unconditional extra step down so SOMETHING can clear.
+        target_agree = min(target_agree, MIN_LAYER_AGREE - 1)
+        target_agree = max(target_agree, GATE_ABS_FLOOR_AGREE)
+        target_dis   = max(target_dis, MAX_LAYER_DISAGREE + 1)
+        target_dis   = min(target_dis, GATE_ABS_CEIL_DISAGREE)
+
+    changed = (target_agree, target_dis) != (MIN_LAYER_AGREE, MAX_LAYER_DISAGREE)
+    tag = "[GateStarvation]" if starved else "[GateRecalib]"
+    print(f"{tag} pooled n={len(state.recent_gate_votes)} agree(mean={agree_arr.mean():.1f} "
+          f"p{100*(1-GATE_TARGET_PASS_RATE):.0f}={np.percentile(agree_arr, 100*(1-GATE_TARGET_PASS_RATE)):.1f} "
+          f"max={agree_arr.max()}) disagree(mean={disagree_arr.mean():.1f}) -- "
+          f"{'ADJUSTED' if changed else 'no change needed'}: "
+          f"agree {MIN_LAYER_AGREE}->{target_agree}  disagree {MAX_LAYER_DISAGREE}->{target_dis}  "
+          f"(targeting ~{GATE_TARGET_PASS_RATE:.0%} pass rate)")
+
+    state.last_gate_recalib_time = now
+    if changed:
+        MIN_LAYER_AGREE, MAX_LAYER_DISAGREE = target_agree, target_dis
+        if _store:
+            _store.save_gates(MIN_LAYER_AGREE, MAX_LAYER_DISAGREE,
+                              MIN_EXP_WIN_RATE, state.adaptive_threshold)
+
+
+# ---------------------------------------------------------------------------
+# SELF-IMPROVEMENT: AUTO-TUNE ENTRY GATES
+# Adjusts MIN_LAYER_AGREE, MAX_LAYER_DISAGREE, MIN_EXP_WIN_RATE from the
+# rolling step-0 win rate. Called every 50 step-0 trades and post-calibration.
+# Gate changes are persisted to Supabase so Railway restarts inherit them.
+# (Secondary quality-control layer -- see the block comment above
+# maybe_recalibrate_gate() for how this and that function divide the work.)
+# ---------------------------------------------------------------------------
+def autotune_gates(state):
+    global MIN_LAYER_AGREE, MAX_LAYER_DISAGREE, MIN_EXP_WIN_RATE
+    # v15 BUGFIX: was summing state.step0_wins/step0_total, the LIFETIME
+    # cumulative counters -- see TradeState.step0_recent_outcomes for why
+    # that permanently locks the gates once a historically bad stretch
+    # (e.g. pre-fix trades) drags the all-time win rate below 0.46. Using
+    # the bounded rolling window means old performance actually ages out.
+    all_recent = [o for outcomes in state.step0_recent_outcomes.values()
+                  for o in outcomes]
+    total_trades = len(all_recent)
+    if total_trades < 50:
+        return
+    total_wins = sum(all_recent)
+    wr = total_wins / total_trades
+    changed = False
+    if wr < 0.46:
+        new_agree = min(MIN_LAYER_AGREE + 1, GATE_ABS_CEIL_AGREE)
+        new_dis   = max(MAX_LAYER_DISAGREE - 1, GATE_ABS_FLOOR_DISAGREE)
+        new_mc    = min(MIN_EXP_WIN_RATE + 0.01, 0.58)
+        if (new_agree, new_dis, new_mc) != (MIN_LAYER_AGREE, MAX_LAYER_DISAGREE, MIN_EXP_WIN_RATE):
+            MIN_LAYER_AGREE, MAX_LAYER_DISAGREE, MIN_EXP_WIN_RATE = new_agree, new_dis, new_mc
+            changed = True
+            print(f"[AutoTune] WR={wr:.3f} over {total_trades} trades < 0.46 → TIGHTENED: "
+                  f"agree>={MIN_LAYER_AGREE} disagree<={MAX_LAYER_DISAGREE} MC>={MIN_EXP_WIN_RATE:.2f}")
+    elif wr > 0.54 and total_trades >= 100:
+        # FIX v3: floor lowered 10→7, disagree ceiling raised 4→6.
+        # The previous floor of 10 meant autotune could never relax below
+        # the level that was already starving the bot of trades (confirmed:
+        # it settled at 11, one step above its own floor of 10). With the
+        # new 9/4 starting point and a real floor of 7/6, autotune now has
+        # genuine room to explore toward more trade flow if win rate stays
+        # healthy, rather than oscillating against a ceiling that was set
+        # before the new downstream gates existed to share the filtering load.
+        new_agree = max(MIN_LAYER_AGREE - 1, GATE_ABS_FLOOR_AGREE)
+        new_dis   = min(MAX_LAYER_DISAGREE + 1, GATE_ABS_CEIL_DISAGREE)
+        new_mc    = max(MIN_EXP_WIN_RATE - 0.01, 0.50)
+        if (new_agree, new_dis, new_mc) != (MIN_LAYER_AGREE, MAX_LAYER_DISAGREE, MIN_EXP_WIN_RATE):
+            MIN_LAYER_AGREE, MAX_LAYER_DISAGREE, MIN_EXP_WIN_RATE = new_agree, new_dis, new_mc
+            changed = True
+            print(f"[AutoTune] WR={wr:.3f} over {total_trades} trades > 0.54 → RELAXED: "
+                  f"agree>={MIN_LAYER_AGREE} disagree<={MAX_LAYER_DISAGREE} MC>={MIN_EXP_WIN_RATE:.2f}")
+    else:
+        print(f"[AutoTune] WR={wr:.3f} over {total_trades} trades — gates unchanged.")
+    if changed and _store:
+        _store.save_gates(MIN_LAYER_AGREE, MAX_LAYER_DISAGREE,
+                          MIN_EXP_WIN_RATE, state.adaptive_threshold)
+
+
+# ---------------------------------------------------------------------------
+# LAYER 12: MONTE CARLO DURATION SELECTOR
+# ---------------------------------------------------------------------------
+# =============================================================================
+# HMM/GBM ADVANCED MONTE CARLO ENGINE (v4)
+# =============================================================================
+HMM_POSTERIOR_LOOKBACK = 50   # ticks of recent returns fed to predict_proba()
+                              # to get the current filtered state posterior --
+                              # same window hmm_trend_weight() already uses
+                              # for `recent_returns` at its call site.
+# v4 CORRECTION: an earlier draft of this engine fit its own dependency-free
+# 2-state Gaussian HMM (mirroring the EXPIRYRANGE bot, which has no HMM of
+# its own). That was the wrong call HERE -- this file already fits a real
+# hmmlearn GaussianHMM per symbol per cycle (fit_hmm(), "LAYER 2" above,
+# cached as models.hmm_model) as part of the validated 18-layer stack.
+# Fitting a second, cruder HMM alongside it would waste compute and give two
+# HMMs a mild chance of disagreeing with each other for no good reason. The
+# engine below is a thin adapter around the EXISTING model.hmm_model instead.
+
+def _hmm_state_params(hmm_model) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    """Extracts (means, sds) per state from a fit hmmlearn GaussianHMM,
+    ordered as hmmlearn returns them (component order is arbitrary but
+    consistent within one fit -- we don't need calm/volatile labelling
+    here, only per-state parameters and the filtered posterior)."""
+    try:
+        means = hmm_model.means_.flatten()
+        sds   = np.array([np.sqrt(c[0][0]) for c in hmm_model.covars_])
+        if not (np.all(np.isfinite(means)) and np.all(np.isfinite(sds)) and np.all(sds > 0)):
+            return None
+        return means, sds
+    except Exception:
+        return None
+
+
+def hmm_gbm_terminal_log_returns(hmm_model, recent_returns: np.ndarray,
+                                 fallback_vol: float, n_steps: int, n_sims: int,
+                                 rng: Optional[np.random.Generator] = None) -> np.ndarray:
+    """
+    Draws n_sims cumulative log-return samples over n_steps ticks using the
+    EXISTING per-symbol hmmlearn model (models.hmm_model, fit_hmm()). Each
+    simulated path draws ONE regime from the model's current filtered
+    posterior (model.predict_proba on recent_returns, same call
+    hmm_trend_weight() already makes) and stays in it for the whole horizon
+    -- regime persistence over a 1-10 tick horizon is a reasonable
+    approximation given these models' typically high self-transition
+    probabilities. Falls back to a flat single-Gaussian model if hmm_model
+    is None or too few recent_returns are available to get a posterior.
+    """
+    rng = rng or np.random.default_rng()
+    params = _hmm_state_params(hmm_model) if hmm_model is not None else None
+    if params is None or len(recent_returns) < 5:
+        return rng.normal(0.0, max(fallback_vol, 1e-9) * math.sqrt(n_steps), size=n_sims)
+
+    means, sds = params
+    try:
+        posterior = hmm_model.predict_proba(recent_returns.reshape(-1, 1))[-1]
+    except Exception:
+        return rng.normal(0.0, max(fallback_vol, 1e-9) * math.sqrt(n_steps), size=n_sims)
+
+    if len(posterior) != len(means):
+        return rng.normal(0.0, max(fallback_vol, 1e-9) * math.sqrt(n_steps), size=n_sims)
+
+    state_idx = rng.choice(len(posterior), size=n_sims, p=posterior / posterior.sum())
+    mu_path = means[state_idx] * n_steps
+    # v10 FIX: same duration bias as monte_carlo_duration()'s Gaussian half
+    # (see that function's comment for the full explanation) -- `means`
+    # here are the HMM's FITTED per-state emission means, themselves
+    # estimated from limited history via EM, not known-true parameters.
+    # Projecting them forward by n_steps without accounting for their own
+    # estimation uncertainty produces the same runaway-confidence-at-long-
+    # duration artifact. HMM_POSTERIOR_LOOKBACK is used as a conservative
+    # proxy for the effective sample size behind each state's mean
+    # estimate (not exact -- the true per-state observation count isn't
+    # tracked here -- but enough to stop the bias from compounding).
+    effective_n = max(HMM_POSTERIOR_LOOKBACK, 10)
+    mean_se = sds[state_idx] / math.sqrt(effective_n)
+    drift_uncertainty = mean_se * n_steps
+    diffusion_std = sds[state_idx] * math.sqrt(n_steps)
+    sd_path = np.clip(np.sqrt(drift_uncertainty ** 2 + diffusion_std ** 2), 1e-9, None)
+    return rng.normal(mu_path, sd_path)
+
+
+def hmm_gbm_scan(prices: np.ndarray, returns: np.ndarray,
+                 candidate_durations: List[int],
+                 n_sims: int = MC_SIMULATIONS,
+                 hmm_model=None
+                 ) -> dict:
+    """
+    Advanced Monte Carlo: independently sweeps BOTH direction (CALL/PUT)
+    and every candidate duration, blending two sources 50/50:
+      - the EXISTING per-symbol hmmlearn GaussianHMM (models.hmm_model,
+        fit_hmm() -- "Layer 2" of the 18-layer stack) via regime-
+        conditional GBM sampling, and
+      - a model-free block-bootstrap resample of actual historical returns
+        (same "parametric + empirical" ensemble pattern used in the
+        EXPIRYRANGE bot, and consistent with this file's own pre-existing
+        bootstrap_mc_p_directional philosophy).
+
+    `hmm_model` should be the caller's already-fit models.hmm_model for
+    this symbol/cycle (avoids re-fitting); pass None to run the bootstrap
+    half alone (flat-Gaussian fallback for the GBM half).
+
+    Returns a dict:
+      {"direction": +1/-1, "duration": int, "p": float, "edge": float,
+       "grid": {(dir, dur): p, ...}, "hmm_used": bool}
+    `edge` = |p - 0.5|, the strength of the MC's own directional read at
+    its chosen (direction, duration) pair -- the largest edge anywhere in
+    the full grid.
+    """
+    if len(returns) < 30 or len(prices) < 2:
+        return {"direction": 1, "duration": candidate_durations[0],
+                "p": 0.5, "edge": 0.0, "grid": {}, "hmm_used": False}
+
+    rng = np.random.default_rng()
+    recent_returns = returns[-HMM_POSTERIOR_LOOKBACK:]
+    fallback_vol = float(np.std(returns[-50:])) if len(returns) >= 50 else float(np.std(returns))
+    hmm_used = hmm_model is not None and _hmm_state_params(hmm_model) is not None
+
+    n_gbm  = n_sims // 2
+    n_boot = n_sims - n_gbm
+
+    # v10 FIX (bootstrap-side duration bias): summing `dur` block-
+    # resampled returns from a FIXED historical window mechanically
+    # amplifies whatever that window's own realized sample mean happens
+    # to be -- not a genuine edge, just this specific finite sample's
+    # noise -- by a factor of `dur`, producing the exact same "longer
+    # duration looks mechanically more confident" artifact as
+    # monte_carlo_duration()'s parametric drift term (see that function's
+    # comment for the full explanation), just arriving via resampling
+    # instead of a point estimate. Demeaning the pool once before
+    # resampling removes that window-level mean artifact while fully
+    # preserving the local autocorrelation/clustering structure the
+    # block bootstrap exists to capture (that structure lives in how
+    # consecutive returns co-move, not in the pool's overall average).
+    returns_demeaned = returns - np.mean(returns)
+
+    grid = {}
+    best = None
+    for dur in candidate_durations:
+        gbm_log_ret = hmm_gbm_terminal_log_returns(
+            hmm_model, recent_returns, fallback_vol, dur, n_gbm, rng=rng)
+
+        # Model-free half: block-bootstrap resample of actual historical
+        # returns (same block-resampling idea as bootstrap_mc_p_directional
+        # below, reused inline here since we need raw terminal values, not
+        # just a directional probability, to blend with the GBM half).
+        boot_log_ret = np.empty(n_boot)
+        if len(returns) >= BOOTSTRAP_BLOCK_SIZE * 3:
+            n_blocks_needed = max(1, (dur + BOOTSTRAP_BLOCK_SIZE - 1) // BOOTSTRAP_BLOCK_SIZE)
+            max_start = max(1, len(returns) - BOOTSTRAP_BLOCK_SIZE)
+            for i in range(n_boot):
+                idx = rng.integers(0, max_start, size=n_blocks_needed)
+                sampled = np.concatenate([returns_demeaned[j:j + BOOTSTRAP_BLOCK_SIZE] for j in idx])[:dur]
+                boot_log_ret[i] = float(np.sum(sampled))
+        else:
+            boot_log_ret[:] = gbm_log_ret[:n_boot] if n_boot <= n_gbm else \
+                rng.choice(gbm_log_ret, size=n_boot, replace=True)
+
+        combined = np.concatenate([gbm_log_ret, boot_log_ret])
+        p_up = float(np.mean(combined > 0))
+
+        for direction, p in ((1, p_up), (-1, 1.0 - p_up)):
+            grid[(direction, dur)] = p
+            # FIX: was abs(p - 0.5). CALL at p and PUT at 1-p then tie on "edge"
+            # and CALL, evaluated first, always won -- so this scan reported
+            # direction=CALL even when p_up < 0.5, and Gate 5 vetoed every
+            # borderline PUT. Signed edge picks the side the simulation favours.
+            edge = p - 0.5
+            if best is None or edge > best["edge"]:
+                best = {"direction": direction, "duration": dur, "p": p, "edge": edge}
+
+    best["grid"] = grid
+    best["hmm_used"] = hmm_used
+    return best
+
+
+# ---------------------------------------------------------------------------
+# v7: RISEFALL LSTM ENSEMBLE — Gate 6 (see LSTM_* constants above)
+# ---------------------------------------------------------------------------
+def lstm_evaluate(sd: "SymbolData") -> Optional[dict]:
+    """LSTM removed -- always 'no opinion', so Gate 6 never vetoes and the
+    standalone-LSTM path never fires."""
+    return None
+
+
+def monte_carlo_duration(prices, returns, direction, feats, candidate_durations,
+                         n_sims=MC_SIMULATIONS, models=None):
+    """Takes the direction already decided by the Bayesian layer (does NOT
+    re-decide direction) and simulates forward paths to find which duration
+    maximizes expected win probability.
+
+    OU reversion pull weighted by (1 - trend_weight) - same weighting Bayesian
+    fusion used when deciding direction, so MC never silently fights the chosen
+    direction (fixed the exp_win=0.00 bug from earlier logs).
+
+    When deep startup calibration has produced empirical per-duration win rates,
+    those are blended with the simulation estimate (70% sim / 30% empirical) so
+    duration selection is anchored to what actually happened on this symbol.
+
+    v4: the parametric terminal draw is now blended 50/50 with an HMM/GBM
+    regime-conditional draw using the SAME per-symbol hmmlearn model
+    (models.hmm_model, fit_hmm() -- "Layer 2") the rest of the stack already
+    relies on, rather than fitting a separate model -- same "advanced Monte
+    Carlo" upgrade as the EXPIRYRANGE bot, without duplicating HMM fitting.
+    Falls back to the flat Gaussian-only behaviour if models.hmm_model is
+    None (not enough history yet for that symbol)."""
+    if len(returns) < 20:
+        return candidate_durations[0], 0.5
+
+    cond_vol = feats.get("cond_vol")
+    vol = cond_vol if cond_vol and cond_vol > 0 else (np.std(returns[-50:]) if len(returns) >= 50 else np.std(returns))
+    vol = vol if vol > 0 else 1e-6
+
+    hawkes_signal = feats.get("hawkes", 0.0)
+    # v10 FIX (second, deeper bias source): this used to be
+    # `direction * abs(np.mean(returns[-50:]))` -- taking the ABSOLUTE
+    # VALUE of recent momentum and reapplying it in whatever direction was
+    # already chosen upstream. That forces E[drift] > 0 in the trade's
+    # favor even on PURE NOISE (E[|X|] > 0 even when E[X]=0, for any
+    # non-degenerate X), and since this drift is projected forward by
+    # `dur`, that constant one-sided bias compounds with duration --
+    # exactly the "MC favors long durations" symptom, and independently
+    # of that, it also quietly defeats Gate 5's whole purpose as a check
+    # INDEPENDENT of the layer stack's direction, since it was
+    # mathematically guaranteed to agree with whatever direction Gates
+    # 1-4 already picked. Using the SIGNED mean instead means a genuine
+    # headwind (recent momentum actually running against the chosen
+    # direction) shows up as a headwind, and E[drift] = 0 exactly on pure
+    # noise, matching this function's own "vol/drift ≈ 0 by design on
+    # these instruments" assumption instead of silently violating it.
+    # FIX: was `direction * mean`, which inverted recent momentum for PUTs -- a
+    # Fall only passed this check when price had been RISING, and Gate 4 then
+    # rejected it, so the bot only ever traded Rise. Drift is the signed mean;
+    # the win test below already accounts for direction.
+    drift = np.mean(returns[-50:]) * (1 + abs(hawkes_signal) * 0.5) if len(returns) >= 50 else 0.0
+
+    ou_params = feats.get("ou_params")
+    trend_weight = feats.get("trend_weight", 0.5)
+    current_price = prices[-1]
+    reversion_pull = 0.0
+    if ou_params and ou_params.get("theta", 0) > 0:
+        raw_pull = ou_params["theta"] * (ou_params["mu"] - current_price) * 0.01
+        reversion_pull = raw_pull * (1 - trend_weight)
+
+    empirical = getattr(models, "empirical_duration_win_rates", {}) if models else {}
+    hmm_model = getattr(models, "hmm_model", None) if models else None
+    recent_returns = returns[-HMM_POSTERIOR_LOOKBACK:] if len(returns) >= HMM_POSTERIOR_LOOKBACK else returns
+    use_hmm = hmm_model is not None and _hmm_state_params(hmm_model) is not None
+    rng = np.random.default_rng()
+
+    # ── Terminal displacement model ───────────────────────────────────────
+    # Deriv Rise/Fall settles on price[expiry] vs price[entry]. The correct
+    # model for the terminal displacement after `dur` independent ticks is:
+    #
+    #   X_T ~ N(drift * dur, vol * sqrt(dur))
+    #
+    # The old approach summed `dur` individual N(drift, vol) draws, which is
+    # mathematically identical to N(drift*dur, vol*sqrt(dur)) for the terminal
+    # value BUT it was computing wins as sum(steps)>0 rather than sampling from
+    # the correct terminal distribution — introducing a monotone duration bias
+    # where longer durations always won because drift accumulated faster than
+    # noise.
+    #
+    # v10 FIX — that bias was NOT actually eliminated by switching to direct
+    # terminal-distribution sampling, only reduced. `drift` here is a POINT
+    # ESTIMATE (np.mean of the last 50 returns), not a known-true parameter --
+    # it carries its own estimation uncertainty (standard error), and that
+    # uncertainty was never propagated into the simulation. Since the drift
+    # TERM scales as O(dur) while diffusion noise alone only scales as
+    # O(sqrt(dur)), ANY nonzero drift estimate -- including one that's pure
+    # sampling noise with no real predictive content -- mechanically produces
+    # increasingly extreme (and increasingly WRONG) confidence as `dur` grows,
+    # purely from the math of projecting a noisy point estimate further into
+    # the future. This is exactly why an MC built this way ends up biased
+    # toward picking the longest candidate duration regardless of whether
+    # longer durations are genuinely more predictable.
+    #
+    # The fix: treat drift as an ESTIMATED parameter with its own standard
+    # error (std of the estimation window / sqrt(window size)), and combine
+    # that DRIFT uncertainty with diffusion uncertainty IN QUADRATURE for the
+    # terminal std: sqrt((dur*drift_se)^2 + (vol*sqrt(dur))^2). The
+    # drift-uncertainty term grows as O(dur) too now, so it catches up with
+    # and eventually dominates the drift term itself at long durations,
+    # correctly preventing runaway confidence in a noisy estimate instead of
+    # rewarding it.
+    drift_window = returns[-50:] if len(returns) >= 50 else returns
+    n_drift = max(len(drift_window), 2)
+    drift_se = float(np.std(drift_window)) / math.sqrt(n_drift)
+
+    best = None
+    for dur in candidate_durations:
+        drift_uncertainty = drift_se * dur
+        diffusion_std = vol * np.sqrt(dur)
+        total_std = float(np.sqrt(drift_uncertainty ** 2 + diffusion_std ** 2))
+
+        # Sample terminal displacement directly — no tick-by-tick accumulation
+        gaussian_terminal = rng.normal(
+            (drift + reversion_pull) * dur,   # expected drift over dur ticks
+            total_std,                        # diffusion AND drift-estimation uncertainty
+            size=n_sims // 2 if use_hmm else n_sims
+        )
+        if use_hmm:
+            # v4: HMM/GBM half — regime-conditional, no directional drift
+            # bias injected (that's already carried by the Gaussian half via
+            # `drift`/`reversion_pull`; this half instead contributes a more
+            # realistic REGIME-DEPENDENT variance/tail shape), then shifted
+            # by the same drift+reversion so both halves are centred
+            # consistently before being combined.
+            gbm_log_ret = hmm_gbm_terminal_log_returns(
+                hmm_model, recent_returns, vol, dur, n_sims - n_sims // 2, rng=rng)
+            gbm_terminal = gbm_log_ret + (drift + reversion_pull) * dur
+            terminal = np.concatenate([gaussian_terminal, gbm_terminal])
+        else:
+            terminal = gaussian_terminal
+        wins = np.sum(terminal > 0) if direction > 0 else np.sum(terminal < 0)
+        sim_win_rate = wins / len(terminal)
+
+        # FIX v2: Magnitude-weighted win rate.
+        # A naive win-count treats a path that ends barely past zero the same
+        # as one that ends far in favour of the direction. Borderline paths
+        # are weak evidence and inflate the apparent edge. Weighting by
+        # |terminal|/std down-weights borderline crossings and produces a
+        # sharper, more honest estimate of genuine directional conviction.
+        std_term = float(np.std(terminal)) + 1e-9
+        favourable = terminal if direction > 0 else -terminal
+        weights = 1.0 + np.tanh(np.abs(favourable) / std_term)
+        weighted_win_rate = float(
+            np.sum(weights * (favourable > 0)) / np.sum(weights)
+        )
+
+        # Blend: empirical (primary) + simulation win-rate (sim) + weighted overlay.
+        # Empirical still dominates at 70% when available; the remaining 30%
+        # is split between raw and magnitude-weighted simulation estimates.
+        sim_component = 0.5 * sim_win_rate + 0.5 * weighted_win_rate
+        blended = (0.30 * sim_component + 0.70 * empirical[dur]
+                   if dur in empirical and empirical[dur] > 0
+                   else sim_component)
+        if best is None or blended > best[1]:
+            best = (dur, blended)
+    return best
+
+
+# ---------------------------------------------------------------------------
+# FIX v2 — NEW: BOOTSTRAP META-ENSEMBLE MC (model-free second opinion)
+# ---------------------------------------------------------------------------
+# monte_carlo_duration() above is fully parametric: it assumes the terminal
+# displacement is Gaussian with drift/vol estimated from recent returns.
+# This bootstrap version instead resamples BLOCKS of actual historical
+# returns (preserving short-range autocorrelation structure) and is
+# completely model-free. When the parametric and bootstrap estimates
+# agree, the signal is much more likely to reflect genuine structure rather
+# than a parametric modelling artefact. Used as an additional soft check
+# before committing to a trade — see usage in the main loop.
+BOOTSTRAP_BLOCK_SIZE = 10
+BOOTSTRAP_N_PATHS    = 2000
+BOOTSTRAP_AGREE_TOL  = float(os.getenv("BOOTSTRAP_AGREE_TOL", "0.08"))   # max allowed disagreement before flagging
+
+def bootstrap_mc_p_directional(returns, direction, duration, block_size=BOOTSTRAP_BLOCK_SIZE,
+                               n_paths=BOOTSTRAP_N_PATHS):
+    """
+    Model-free estimate of P(terminal move favours `direction`) at `duration`
+    ticks ahead, built by resampling contiguous blocks of historical returns.
+    """
+    returns = np.asarray(returns)
+    if len(returns) < block_size * 3:
+        return 0.5
+    n_blocks_needed = max(1, (duration + block_size - 1) // block_size)
+    max_start = max(1, len(returns) - block_size)
+    outcomes = np.empty(n_paths)
+    for i in range(n_paths):
+        idx = np.random.randint(0, max_start, size=n_blocks_needed)
+        sampled = np.concatenate([returns[j:j + block_size] for j in idx])[:duration]
+        terminal_logret = float(np.sum(sampled))
+        outcomes[i] = terminal_logret
+    favourable = outcomes if direction > 0 else -outcomes
+    return float(np.mean(favourable > 0))
+
+
+def meta_ensemble_agrees(returns, direction, duration, parametric_p,
+                         tol=BOOTSTRAP_AGREE_TOL):
+    """
+    Returns (agrees: bool, bootstrap_p: float).
+    If the model-free bootstrap estimate disagrees with the parametric MC
+    estimate by more than `tol`, the signal should be treated with extra
+    suspicion — the parametric model (Gaussian terminal displacement) may
+    not be capturing the symbol's actual return structure right now.
+    """
+    bootstrap_p = bootstrap_mc_p_directional(returns, direction, duration)
+    agrees = abs(bootstrap_p - parametric_p) <= tol
+    return agrees, bootstrap_p
+
+
+# ---------------------------------------------------------------------------
+# v3: UNIFIED SIGNAL FUSION — meta-learner with Bayesian fallback
+# ---------------------------------------------------------------------------
+def fuse_signal(features: dict, state: "TradeState",
+                symbol: str) -> Tuple[float, float]:
+    """
+    Primary signal fusion entry point for all signal evaluation in the bot.
+    Routes to MetaLearner when enough training data exists; otherwise falls
+    back to bayesian_fusion transparently.
+
+    Also applies confidence calibration to the output probability before
+    returning, so all downstream Kelly sizing uses calibrated estimates.
+
+    Returns: (p_up_calibrated, confidence)
+    """
+    x = MetaLearner.feats_to_vector(features)
+    meta_p = MetaLearner.predict(state, symbol, x)
+
+    if meta_p is not None:
+        # Meta-learner path
+        n = len(state.meta_buffer[symbol])
+        p_up = meta_p
+        confidence = abs(p_up - 0.5) * 2.0 * features.get("vol_trust", 1.0) \
+                     * features.get("entropy_trust", 1.0)
+        if n >= META_MIN_SAMPLES and n % 200 == 0:
+            # Periodic log of meta-learner usage
+            print(f"[MetaLearner] {symbol}: active ({n} samples), "
+                  f"p_up={p_up:.3f}")
+    else:
+        # Bayesian fallback
+        p_up, confidence = bayesian_fusion(features)
+
+    # Apply confidence calibration
+    p_up_cal = ConfidenceCalibrator.calibrate(p_up, state, symbol)
+    # Recalculate confidence from calibrated p_up
+    confidence_cal = abs(p_up_cal - 0.5) * 2.0 * features.get("vol_trust", 1.0) \
+                     * features.get("entropy_trust", 1.0)
+
+    return p_up_cal, confidence_cal
+
+
+# ---------------------------------------------------------------------------
+# LAYER AGREEMENT GATE
+# ---------------------------------------------------------------------------
+def passes_layer_gate(feats, direction, regime=None):
+    """Returns (passes: bool, agree: int, disagree: int, neutral: int).
+
+    Gate: agree >= MIN_LAYER_AGREE AND disagree <= MAX_LAYER_DISAGREE.
+
+    REGIME-AWARE COUNTING (added with regime routing):
+    When `regime` is supplied, the vote counts are computed over ONLY that
+    regime's active layer set, not all 17.
+
+    Why this matters: the regime router deliberately consults 6-7 layers
+    and ignores the other 10 precisely because their assumptions do not
+    hold in the current regime. Counting all 17 here re-admits exactly the
+    noise the routing exists to remove — mean-reversion layers voting
+    against a trend-regime signal were producing rejections like
+    "8 agree / 6 disagree" where the 6 disagreeing layers were ones the
+    router had already ruled irrelevant. Gate 1 was overruling the routing
+    with the very votes the routing excluded.
+
+    Counting only the active set preserves what this gate is FOR — needing
+    enough layers to concur, not merely a couple of loud ones — while
+    respecting which layers are currently meaningful. The thresholds are
+    scaled proportionally, since requiring 9-of-17 makes no sense when
+    only 7 layers are voting.
+
+    Passing regime=None restores the original all-17 behaviour exactly.
+    """
+    if regime is not None:
+        try:
+            from regime_conviction import REGIME_LAYERS, LAYER_NAMES
+            active = set(REGIME_LAYERS.get(regime, []))
+            votes  = feats.get("layer_votes")
+            if active and votes and len(votes) == len(LAYER_NAMES):
+                sel = [v for n, v in zip(LAYER_NAMES, votes) if n in active]
+                up   = sum(1 for v in sel if v > 0)
+                down = sum(1 for v in sel if v < 0)
+                neutral = len(sel) - up - down
+                if direction > 0:
+                    agree, disagree = up, down
+                else:
+                    agree, disagree = down, up
+                # Scale thresholds to the active subset size, with a floor
+                # of 3 agreeing so a 6-layer regime still needs real
+                # consensus rather than a bare majority of two.
+                frac = len(sel) / float(len(LAYER_NAMES))
+                min_agree = max(3, int(round(MIN_LAYER_AGREE * frac)))
+                max_dis   = max(1, int(round(MAX_LAYER_DISAGREE * frac)))
+                passes = (agree >= min_agree) and (disagree <= max_dis)
+                return passes, agree, disagree, neutral
+        except Exception as exc:
+            print(f"[Gate] regime-aware counting failed ({exc}) — "
+                  f"falling back to all-layer counting")
+
+    if direction > 0:
+        agree    = feats["agree_up"]
+        disagree = feats["disagree_up"]
+    else:
+        agree    = feats["disagree_up"]   # votes against CALL = votes FOR PUT
+        disagree = feats["agree_up"]
+    neutral  = feats["n_neutral"]
+    passes   = (agree >= MIN_LAYER_AGREE) and (disagree <= MAX_LAYER_DISAGREE)
+    return passes, agree, disagree, neutral
+
+
+# ---------------------------------------------------------------------------
+# ENSEMBLE SELECTOR
+# ---------------------------------------------------------------------------
+def select_trade(symbol_scores, reliability, global_threshold, per_symbol_threshold=None):
+    """Selects the single strongest-signal symbol that clears its own
+    per-symbol threshold (derived from that symbol's OOS confidence
+    distribution during deep calibration). Falls back to the global threshold
+    for symbols without a calibrated per-symbol value.
+
+    Per-symbol thresholds mean a symbol with naturally lower confidence scores
+    (e.g. R_10 which is more random) gets judged against its own distribution,
+    not penalised against a global bar set by a more predictable symbol."""
+    per_sym_thr = per_symbol_threshold or {}
+    scored = []
+    for symbol, (p_up, confidence) in symbol_scores.items():
+        score     = confidence * reliability.get(symbol, 1.0)
+        direction = 1 if p_up > 0.5 else -1
+        thr       = per_sym_thr.get(symbol, global_threshold)
+        scored.append((symbol, direction, p_up, score, thr))
+
+    if not scored:
+        return None
+
+    # Filter: each symbol must clear its own threshold
+    scored = [s for s in scored if s[3] >= s[4]]
+    if not scored:
+        return None
+
+    scored.sort(key=lambda x: x[3], reverse=True)
+    top = scored[0]
+
+    # Gap check: top scorer must lead runner-up meaningfully
+    if len(scored) > 1 and (top[3] - scored[1][3]) < MIN_SCORE_GAP:
+        return None
+
+    return top[:4]   # (symbol, direction, p_up, score)
+
+
+# ---------------------------------------------------------------------------
+# STAKING
+# ---------------------------------------------------------------------------
+def calculate_stake(balance):
+    """stake = max($0.35, 2% of balance) - single formula, no seam/discontinuity.
+    Used as the FLOOR/fallback stake. See kelly_adjusted_stake() for the
+    edge-aware sizing now used at the call site."""
+    return round(max(MIN_STAKE, balance * STAKE_PCT), 2)
+
+
+# ---------------------------------------------------------------------------
+# FIX v2 — NEW: FRACTIONAL KELLY STAKE SIZING
+# ---------------------------------------------------------------------------
+# The fixed 2%-of-balance formula above sizes every trade identically
+# regardless of how strong the signal is. Fractional Kelly instead scales
+# the stake with the model's own estimated edge, so high-conviction signals
+# get proportionally more capital and marginal signals get less — without
+# ever exceeding a hard ceiling.
+#
+# Binary option Kelly: f* = (p * b - (1 - p)) / b
+#   p = model's estimated win probability (exp_win_rate from MC, NOT raw p_up)
+#   b = net payout ratio (e.g. 0.95 for a 95%-payout contract)
+# Quarter-Kelly (fraction=0.25) is used to keep variance survivable.
+KELLY_FRACTION         = 0.25
+KELLY_DEFAULT_PAYOUT   = 0.88   # conservative prior before any history exists
+KELLY_MIN_HISTORY      = 15     # minimum resolved trades before trusting empirical payout
+KELLY_STAKE_CEILING_PCT = 0.04  # never let Kelly alone push stake above 4% of balance
+
+def record_payout(state, symbol, stake, profit, won):
+    """Call after every resolved step-0 trade to update the empirical payout
+    ratio used by kelly_adjusted_stake(). Only winning trades carry payout
+    information (losing trades return profit=-stake, which is not payout)."""
+    if won and stake > 0:
+        ratio = profit / stake
+        hist = state.payout_history[symbol]
+        hist.append(ratio)
+        if len(hist) > 50:
+            hist.pop(0)
+
+
+def empirical_payout(state, symbol):
+    """Returns the rolling average payout ratio for a symbol, or the
+    conservative default if not enough history exists yet."""
+    hist = state.payout_history.get(symbol, [])
+    if len(hist) < KELLY_MIN_HISTORY:
+        return KELLY_DEFAULT_PAYOUT
+    return float(np.mean(hist))
+
+
+def recovery_stake_for_loss(state, symbol, cumulative_loss):
+    """Stake sized so that a WIN on this trade recovers cumulative_loss —
+    the total staked and lost so far in the current martingale sequence —
+    using the symbol's real empirical payout ratio (falling back to the
+    same conservative KELLY_DEFAULT_PAYOUT prior Kelly sizing uses when
+    there isn't enough history yet).
+
+    Replaces the old fixed MARTINGALE_FACTOR multiplier, which only
+    approximated recovery and could over- or under-shoot it depending on
+    how far the symbol's actual payout sat from the factor's implied
+    assumption (1/1.24 ≈ 0.81).
+    """
+    payout = empirical_payout(state, symbol)
+    stake = cumulative_loss / max(payout, 0.01)
+    return round(max(stake, MIN_STAKE), 2)
+
+
+def kelly_adjusted_stake(balance, exp_win_rate, symbol, state):
+    """
+    Blends the fixed 2%-of-balance floor with a fractional-Kelly edge-scaled
+    component. The fixed floor protects against under-betting when the model
+    is right but underconfident; the Kelly component lets strong signals size
+    up within a hard ceiling.
+
+    Returns the final stake, already clamped to [MIN_STAKE, balance * KELLY_STAKE_CEILING_PCT].
+    """
+    payout = empirical_payout(state, symbol)
+    p      = float(np.clip(exp_win_rate, 0.01, 0.99))
+
+    # Full Kelly fraction of bankroll
+    f_full = (p * payout - (1 - p)) / payout
+    f_full = max(0.0, f_full)               # never bet on negative edge
+    f_kelly = f_full * KELLY_FRACTION
+
+    kelly_stake = balance * f_kelly
+    floor_stake = calculate_stake(balance)    # existing 2%-of-balance floor
+
+    # Take the larger of the two, but never exceed the hard ceiling
+    raw_stake = max(kelly_stake, floor_stake)
+    ceiling   = balance * KELLY_STAKE_CEILING_PCT
+    final     = min(raw_stake, max(ceiling, MIN_STAKE))
+    return round(max(MIN_STAKE, final), 2)
+
+
+# ---------------------------------------------------------------------------
+# TRADE EXECUTION
+# ---------------------------------------------------------------------------
+def explain_signal(symbol, direction, feats, p_up, confidence, duration, exp_win, score):
+    """Prints a human-readable breakdown of WHY this trade was taken —
+    which layers drove the signal, how strongly, and what the ensemble
+    concluded. Logged once at entry before the contract is placed."""
+    side     = "CALL (UP)" if direction > 0 else "PUT (DOWN)"
+    ts       = datetime.utcnow().isoformat()
+    bar      = "█"
+    sep      = "─" * 60
+
+    def bar_str(val, width=20):
+        """Render a ±1 value as a centred ASCII bar."""
+        v     = float(np.clip(val, -1, 1))
+        mid   = width // 2
+        filled= int(abs(v) * mid)
+        if v >= 0:
+            return " " * mid + bar * filled + " " * (width - mid - filled)
+        else:
+            return " " * (mid - filled) + bar * filled + " " * mid + " " * (width - mid)
+
+    # Compile layer contributions into a ranked list
+    layer_signals = [
+        ("Markov chain",    (feats["markov_p"] - 0.5) * 2),
+        ("HMM regime",      feats["hmm_lean"]),
+        ("Hawkes momentum", feats["hawkes"]),
+        ("OU mean-rev",     feats["ou_dir"] * feats["ou_strength"]),
+        ("Hurst",           feats["hurst_signal"]),
+        ("ARFIMA long-mem", feats["arfima_bias"]),
+        ("Kalman trend",    feats["kalman"]),
+        ("Copula agree",    (feats["copula_agree"] - 0.5) * 2),
+        ("RSI",             feats["rsi_signal"]),
+        ("StochRSI",        feats["srsi_signal"]),
+        ("ADX dir",         feats["adx_dir"] * feats["adx_trend"]),
+        ("Bollinger %B",    feats["boll_signal"]),
+        ("Z-score",         feats["z_signal"]),
+        ("Transfer entropy",feats["te_signal"]),
+        ("Jump direction",  feats["jump_dir"] * feats["jump_intensity"]),
+        ("Post-jump rev",   feats["post_jump"] * feats["jump_intensity"]),
+        ("Support/Resist",  feats["sr_signal"]),
+    ]
+
+    # Sort by absolute contribution, strongest first
+    layer_signals.sort(key=lambda x: abs(x[1]), reverse=True)
+
+    # Count layers agreeing vs disagreeing with the final direction
+    agree    = sum(1 for _, v in layer_signals if v * direction > 0)
+    disagree = sum(1 for _, v in layer_signals if v * direction < 0)
+    neutral  = len(layer_signals) - agree - disagree
+
+    hurst_regime = ("persistent / trending" if feats["hurst"] > 0.55
+                    else "anti-persistent / mean-reverting" if feats["hurst"] < 0.45
+                    else "near-random walk")
+    hmm_regime   = ("trending"  if feats["trend_weight"] > 0.65
+                    else "ranging" if feats["trend_weight"] < 0.4
+                    else "mixed")
+    vol_state    = ("HIGH — signal down-weighted" if feats["vol_trust"] < 0.5
+                    else "ELEVATED" if feats["vol_trust"] < 0.75
+                    else "normal")
+    entropy_state= ("HIGH — low structure"  if feats["entropy_trust"] < 0.4
+                    else "MODERATE" if feats["entropy_trust"] < 0.65
+                    else "low — market is structured")
+    conf_mode    = ("MOMENTUM (RSI/StochRSI/Boll/Z-score follow trend)"
+                    if feats.get("momentum_mode") else
+                    "MEAN-REVERSION (RSI/StochRSI/Boll/Z-score fade extremes)")
+    adx_str      = (f"ADX={feats['adx_val']:.1f}  trend_str={feats['adx_trend']:.2f}"
+                    f"  dir={feats['adx_dir']:+.0f}")
+
+    print(f"\n{sep}")
+    print(f"  TRADE SIGNAL  {ts}")
+    print(sep)
+    print(f"  Symbol  : {symbol}   Direction : {side}")
+    print(f"  p(UP)   : {p_up:.4f}   Confidence: {confidence:.4f}   Score: {score:.4f}")
+    print(f"  Duration: {duration} ticks   MC exp. win rate: {exp_win:.2%}")
+    print(f"  Trust   : vol={feats['vol_trust']:.2f}  entropy={feats['entropy_trust']:.2f}  "
+          f"combined={feats['vol_trust']*feats['entropy_trust']:.2f}")
+    print("\n  Market regime:")
+    print(f"    Hurst H={feats['hurst']:.3f}  → {hurst_regime}")
+    print(f"    HMM trend_weight={feats['trend_weight']:.2f}  → {hmm_regime}")
+    print(f"    Confirmation mode → {conf_mode}")
+    print(f"    {adx_str}")
+    print(f"    Volatility state  → {vol_state}")
+    print(f"    Entropy state     → {entropy_state}")
+    print(f"\n  Layer breakdown  [{agree} agree | {disagree} disagree | {neutral} neutral]")
+    print(f"  {'Layer':<20}  {'Signal':>7}  {'Direction bar (±1)':^22}")
+    print(f"  {'-'*20}  {'-'*7}  {'-'*22}")
+    for name, val in layer_signals:
+        tag = "▲" if val * direction > 0 else ("▼" if val * direction < 0 else "─")
+        print(f"  {name:<20}  {val:>+.4f}  {bar_str(val)}  {tag}")
+    print(f"\n  Decision: {agree}/{len(layer_signals)} layers support {side}")
+    print(sep + "\n")
+
+
+def log_trade(symbol, direction, stake, won, profit, step):
+    ts   = datetime.utcnow().isoformat()
+    side = "CALL" if direction > 0 else "PUT"
+    print(f"[{ts}] {symbol} {side} step={step} stake={stake:.2f} "
+          f"won={won} profit={profit:+.2f}")
+
+
+def log_trade_summary(symbol, direction, stakes_used, profits, sequence_won,
+                      balance_before, balance_after, p_up, confidence, duration,
+                      duration_unit="t"):
+    """Printed once after a full martingale sequence resolves (win or full loss).
+    Gives a compact but complete picture of what happened and what it cost."""
+    ts        = datetime.utcnow().isoformat()
+    side      = "CALL" if direction > 0 else "PUT"
+    n_steps   = len(stakes_used)
+    total_staked = sum(stakes_used)
+    net_pnl   = sum(profits)
+    outcome   = "✓ WON" if sequence_won else "✗ LOST ALL STEPS"
+    bal_delta = balance_after - balance_before
+    sep       = "─" * 60
+    unit_label = "minutes" if duration_unit == "m" else "ticks"
+
+    print(f"\n{sep}")
+    print(f"  TRADE SUMMARY  {ts}")
+    print(sep)
+    print(f"  Symbol    : {symbol}   {side}   {duration} {unit_label}")
+    print(f"  Signal    : p_up={p_up:.4f}   confidence={confidence:.4f}")
+    print(f"  Outcome   : {outcome}")
+    print(f"  Steps used: {n_steps} / {MARTINGALE_MAX_STEPS + 1}")
+    print(f"  {'Step':<6}  {'Stake':>8}  {'Result':>8}  {'P/L':>8}")
+    print(f"  {'-'*6}  {'-'*8}  {'-'*8}  {'-'*8}")
+    for i, (s, p) in enumerate(zip(stakes_used, profits)):
+        result = "WIN" if p > 0 else "LOSS"
+        print(f"  {i:<6}  {s:>8.2f}  {result:>8}  {p:>+8.2f}")
+    print(f"  {'TOTAL':<6}  {total_staked:>8.2f}  {'':>8}  {net_pnl:>+8.2f}")
+    print(f"\n  Balance : {balance_before:.2f} → {balance_after:.2f}  ({bal_delta:+.2f})")
+    print(sep + "\n")
+
+
+async def execute_single_step(client, state, symbol, direction, stake, step, duration=5,
+                              duration_unit="m", feats=None):
+    """Places exactly ONE trade and returns. Never loops to the next martingale
+    step — that decision belongs to the main signal loop, which waits for a
+    genuine quality entry before placing any recovery step.
+
+    feats: if supplied, the layer gate is re-evaluated atomically here as a
+    final check immediately before the buy request is sent. This prevents the
+    race where the gate blocks on tick N but the trade slips through on tick
+    N+1 before a fresh iteration runs the gate check again.
+
+    duration_unit: v10 -- this bot is minutes-only now, always "m" at every
+    call site. If Deriv rejects a minute-duration contract for a given
+    symbol, that FAILS this trade attempt cleanly (logged, no contract
+    placed) rather than silently downgrading to a tick contract -- there
+    is no tick fallback anywhere in this bot anymore, by design."""
+    # ── Atomic final gate check ─────────────────────────────────────────────
+    if feats is not None:
+        gate_ok, n_agree, n_dis, _ = passes_layer_gate(feats, direction)
+        if not gate_ok:
+            print(f"[Gate/Atomic] {symbol} step={step} blocked at execution — "
+                  f"{n_agree} agree / {n_dis} disagree (gate moved between check and fire)")
+            return False, 0.0
+
+    state.trades_in_flight += 1
+    try:
+        state.last_trade_time = time.time()   # v5: feeds the gate starvation breaker
+        won, profit = False, 0.0
+        try:
+            contract_id = await buy_contract(
+                client, symbol, direction, int(duration), duration_unit, stake)
+            # Convert the contract's own duration to seconds so the settle
+            # timeout scales with the trade rather than using a fixed guess.
+            _dur_secs = float(duration) * (60.0 if duration_unit == "m" else 2.0)
+            won, profit = await wait_for_contract_result(
+                client, contract_id, duration_seconds=_dur_secs)
+            log_trade(symbol, direction, stake, won, profit, step)
+        except Exception as e:
+            print(f"[Trade] Error on {symbol} step={step}: {e}")
+
+        # accumulate into the sequence tracker for the summary log
+        state.seq_stakes[symbol].append(stake)
+        state.seq_profits[symbol].append(profit)
+
+        # step-0 raw signal win-rate tracking (honest edge measurement)
+        if step == 0:
+            state.step0_total[symbol] += 1
+            if won:
+                state.step0_wins[symbol] += 1
+            # v15: rolling window feeds autotune_gates(); the lifetime
+            # counters above stay purely for the informational heartbeat
+            # line.
+            state.step0_recent_outcomes[symbol].append(1 if won else 0)
+
+            # FIX v2: Record direction into rolling history (max 30 entries).
+            # Used by bayesian_fusion's direction balance correction to detect
+            # and dampen systematic CALL/PUT bias in the signal layers.
+            state.direction_history.append(direction)
+            if len(state.direction_history) > 30:
+                state.direction_history.pop(0)
+
+            # Record empirical payout ratio for Kelly sizing.
+            record_payout(state, symbol, stake, profit, won)
+
+            # Log direction balance when history is sufficient
+            if len(state.direction_history) >= 10:
+                call_ratio = sum(1 for d in state.direction_history if d == 1) / len(state.direction_history)
+                if call_ratio > 0.80 or call_ratio < 0.20:
+                    print(f"[DirectionBalance] ⚠ {call_ratio:.0%} CALL in last "
+                          f"{len(state.direction_history)} trades — bias correction active")
+
+            if feats is not None:
+                # ── Online layer weight update (Bayesian path) ─────────────────
+                models_ref = state.model_cache.get(symbol)
+                if models_ref is not None:
+                    online_update_layer_weights(models_ref, feats, direction, won)
+
+                # ── v3: Meta-learner online update ─────────────────────────────
+                x = MetaLearner.feats_to_vector(feats)
+                MetaLearner.update(state, symbol, x, direction, won)
+
+                # ── v3: CUSUM drift update ─────────────────────────────────────
+                cusum_fired = DriftDetector.update_cusum(state, symbol, won)
+                if cusum_fired and not state.drift_degraded.get(symbol, False):
+                    state.drift_degraded[symbol] = True
+                    print(f"[Drift/CUSUM] {symbol}: stake reduced to "
+                          f"{DRIFT_STAKE_REDUCTION:.0%} until next recalibration")
+
+            # ── Persist trade to Supabase ───────────────────────────────────────
+            if _store is not None and feats is not None:
+                _store.save_trade(symbol, direction, step, stake, won, profit,
+                                  state.seq_p_up[symbol], state.seq_confidence[symbol],
+                                  state.seq_duration[symbol], feats,
+                                  conviction=state.seq_conviction.get(symbol))
+
+            # ── Auto-tune gates every 50 step-0 trades ─────────────────────────
+            state._trades_since_autotune += 1
+            if state._trades_since_autotune >= 50:
+                autotune_gates(state)
+                state._trades_since_autotune = 0
+
+        try:
+            bal_resp = await client.send({"balance": 1})
+            state.balance = bal_resp["balance"]["balance"]
+        except Exception:
+            pass
+
+    finally:
+        state.trades_in_flight -= 1
+    return won, profit
+
+
+def clear_recovery(state, symbol):
+    """Clear the recovery slot for one originating symbol — called on that
+    symbol's sequence win, exhaustion, or guard-abort. (v12: state.recovery
+    is now a dict keyed by originating symbol, not one shared slot.)"""
+    state.recovery.pop(symbol, None)
+
+
+def reset_sequence_accumulator(state, symbol, balance_now, p_up=0.5, confidence=0.0,
+                               duration=0, duration_unit="t", conviction=None):
+    """Called at the START of a new sequence (step=0 entry) for ONE symbol.
+    Resets that symbol's per-sequence tracking so its summary log reflects
+    only this sequence -- keyed by symbol so concurrent symbols' sequences
+    can't clobber each other (see TradeState.seq_stakes for the incident
+    this fixes)."""
+    state.seq_stakes[symbol]         = []
+    state.seq_profits[symbol]        = []
+    state.seq_balance_before[symbol] = balance_now
+    state.seq_p_up[symbol]           = p_up
+    state.seq_confidence[symbol]     = confidence
+    state.seq_conviction[symbol]     = conviction
+    state.seq_duration[symbol]       = duration
+    state.seq_duration_unit[symbol]  = duration_unit
+
+
+def emit_sequence_summary(state, symbol, direction, sequence_won):
+    """Called at the END of a sequence. Prints the full trade summary."""
+    log_trade_summary(
+        symbol        = symbol,
+        direction     = direction,
+        stakes_used   = list(state.seq_stakes[symbol]),
+        profits       = list(state.seq_profits[symbol]),
+        sequence_won  = sequence_won,
+        balance_before= state.seq_balance_before[symbol],
+        balance_after = state.balance,
+        p_up          = state.seq_p_up[symbol],
+        confidence    = state.seq_confidence[symbol],
+        duration      = state.seq_duration[symbol],
+        duration_unit = state.seq_duration_unit[symbol],
+    )
+
+
+# ---------------------------------------------------------------------------
+# SYMBOL CALIBRATOR (trigger manager + FULL-POWER calibration engine)
+# ---------------------------------------------------------------------------
+def check_calibration_triggers(state, symbol_data=None):
+    """
+    v3: Event-driven recalibration trigger.
+    Fires when any symbol drift detector flags, or the 6-hour backstop elapses.
+    The fixed 2-hour timer from v2 is removed — stable regimes no longer cause
+    unnecessary recalibration; genuine regime shifts are caught faster.
+    Returns ("drift", flagged_symbols) | ("scheduled", None) | None.
+    """
+    now = time.time()
+    if now - state.last_calibration_end < CALIBRATION_COOLDOWN:
+        return None
+    flagged = [s for s, degraded in state.drift_degraded.items() if degraded]
+    if flagged:
+        print(f"[Recal] Drift detected on {flagged} — event-driven recalibration")
+        return "drift", flagged
+    if now - state.last_scheduled_calibration >= SCHEDULED_CALIBRATION_INTERVAL:
+        print("[Recal] 6-hour backstop elapsed — scheduled recalibration")
+        return "scheduled", None
+    return None
+
+
+def walk_forward_validate(sd, train_frac=0.8, horizon=5, step=5):
+    """REAL walk-forward validation: fit models on the first train_frac of the
+    buffered ticks only, then step through the held-out remainder tick by tick
+    (simulating live arrival), generating predictions from the FROZEN trained
+    models and comparing to realized direction `horizon` ticks later. Returns
+    (hit_rate, fitted_models, confidences) - the same models get cached for
+    live trading if validation passes a sane bar, and `confidences` (the raw
+    confidence score at each replayed point) feeds the adaptive threshold
+    calibration in run_calibration."""
+    n_ticks = len(sd.ticks)
+    if n_ticks < MIN_TICKS_FOR_FIT + 100:
+        return 0.5, None, [], {}
+
+    split = max(MIN_TICKS_FOR_FIT, int(n_ticks * train_frac))
+    train_sd = sd.slice_copy(split)
+    # v15: split timing into (a) one-time model fit and (b) the per-tick
+    # replay loop below, so a slow cycle can be attributed to one or the
+    # other. If (a) stays roughly constant across runs while (b) varies,
+    # that points to external CPU contention/throttling (identical
+    # per-iteration work, same iteration count, just slower wall-clock) --
+    # see run_calibration's per-symbol timing print, which surfaces this.
+    _t_fit_start = time.time()
+    models = fit_symbol_models(train_sd)
+    _t_fit_done = time.time()
+    if not models.fitted:
+        return 0.5, None, [], {"fit_s": _t_fit_done - _t_fit_start, "replay_s": 0.0, "n_replayed": 0}
+
+    eval_sd = sd.slice_copy(split)
+    remaining_ticks = list(sd.ticks)[split:]
+    hits, total = 0, 0
+    confidences = []
+    for i in range(0, len(remaining_ticks) - horizon, step):
+        eval_sd.add_tick(*remaining_ticks[i])
+        feats = compute_features(eval_sd, models, {sd.symbol: eval_sd.returns()})
+        if feats is None:
+            continue
+        p_up, confidence = bayesian_fusion(feats)
+        confidences.append(confidence)
+        predicted_dir = 1 if p_up > 0.5 else -1
+        current_price = remaining_ticks[i][1]
+        future_price = remaining_ticks[i + horizon][1]
+        actual_dir = 1 if future_price > current_price else -1
+        hits += int(predicted_dir == actual_dir)
+        total += 1
+    _t_replay_done = time.time()
+
+    hit_rate = hits / total if total > 0 else 0.5
+    timing = {
+        "fit_s":      _t_fit_done - _t_fit_start,
+        "replay_s":   _t_replay_done - _t_fit_done,
+        "n_replayed": total,
+    }
+    return hit_rate, models, confidences, timing
+
+
+
+# ---------------------------------------------------------------------------
+# DEEP STARTUP CALIBRATION
+# ---------------------------------------------------------------------------
+def expanding_window_walk_forward(sd, n_folds=5, horizons=None, step=3):
+    """True expanding-window walk-forward: models are REFITTED at each fold
+    boundary on all data up to that point, then evaluated on the next unseen
+    window. Returns a full report including per-fold hit rates, per-duration
+    empirical win rates, per-layer correlations, and models fitted on the
+    complete dataset for live trading."""
+    if horizons is None:
+        horizons = CANDIDATE_DURATIONS
+
+    n_ticks = len(sd.ticks)
+    if n_ticks < MIN_TICKS_FOR_FIT * 2 + 100:
+        return None
+
+    all_ticks = list(sd.ticks)
+    fold_size = (n_ticks - MIN_TICKS_FOR_FIT) // (n_folds + 1)
+    if fold_size < 30:
+        return None
+
+    per_fold_hit_rates = []
+    per_duration_outcomes = defaultdict(lambda: [0, 0])
+    layer_outcomes = defaultdict(list)
+    all_confidences = []
+    all_p_ups       = []   # v3: for confidence calibration
+    all_outcomes    = []   # v3: for confidence calibration
+    mid_h = horizons[len(horizons) // 2]
+
+    for fold in range(n_folds):
+        train_end = MIN_TICKS_FOR_FIT + fold_size * (fold + 1)
+        test_end  = min(train_end + fold_size, n_ticks)
+        if test_end - train_end < 20:
+            continue
+
+        train_sd = sd.slice_copy(train_end)
+        models   = fit_symbol_models(train_sd)
+        if not models.fitted:
+            continue
+
+        eval_sd    = sd.slice_copy(train_end)
+        test_ticks = all_ticks[train_end:test_end]
+        hits_fold, total_fold = 0, 0
+
+        for i in range(0, len(test_ticks) - max(horizons), step):
+            eval_sd.add_tick(*test_ticks[i])
+            feats = compute_features(eval_sd, models, {sd.symbol: eval_sd.returns()})
+            if feats is None:
+                continue
+            p_up, confidence = bayesian_fusion(feats)
+            all_confidences.append(confidence)
+            all_p_ups.append(float(p_up))   # v3: raw p_up before calibration
+            predicted_dir = 1 if p_up > 0.5 else -1
+            current_price = test_ticks[i][1]
+
+            for h in horizons:
+                if i + h >= len(test_ticks):
+                    continue
+                future_price = test_ticks[i + h][1]
+                actual_dir   = 1 if future_price > current_price else -1
+                won = int(predicted_dir == actual_dir)
+                if h == mid_h:
+                    # v9 FIX (real directional-bias bug): the calibrator
+                    # consumes (raw_p_up, outcome) pairs and learns a
+                    # mapping from raw_p_up -> calibrated P(up). That only
+                    # makes sense if `outcome` means the same thing p_up
+                    # means -- "did price actually go up" -- not "was the
+                    # prediction correct". Those two labels agree when
+                    # predicted_dir==+1 but are OPPOSITES when
+                    # predicted_dir==-1, so feeding `won` in here silently
+                    # trained the isotonic table on "P(this confidence
+                    # level was right)" and then blended that WIN RATE
+                    # directly into a P(up) value in
+                    # ConfidenceCalibrator.calibrate(). A confident, correct
+                    # PUT (raw p_up=0.15, high win rate ~0.7 in that low-p_up
+                    # bin) got dragged toward p_cal=0.535 -- effectively
+                    # flipped toward CALL -- while a confident, correct CALL
+                    # (p_up=0.85) was barely touched, since for that side
+                    # "high win rate" and "high P(up)" happen to point the
+                    # same direction. The result was a one-way ratchet: once
+                    # a few CALLs landed, every subsequent PUT signal got
+                    # diluted or inverted by calibration itself, downstream
+                    # of bayesian_fusion's own recent_call_ratio bias
+                    # correction -- which can't fix a distortion introduced
+                    # AFTER it runs. Fixed by using the symmetric,
+                    # direction-correct label here: did price actually go
+                    # up, full stop. `won` (prediction-correctness) is still
+                    # exactly right for the hit-rate/accuracy reporting
+                    # below (per_duration_outcomes, hits_fold) -- that's a
+                    # genuinely different, legitimately symmetric question
+                    # ("how often is the model right") and stays untouched.
+                    all_outcomes.append(float(actual_dir == 1))
+                per_duration_outcomes[h][0] += won
+                per_duration_outcomes[h][1] += 1
+                if h == mid_h:
+                    hits_fold  += won
+                    total_fold += 1
+
+            # per-layer correlation data (mid horizon only) — all layers
+            if i + mid_h < len(test_ticks):
+                actual_mid = 1 if test_ticks[i + mid_h][1] > current_price else -1
+                for layer, key in [
+                    ("markov",    "markov_p"),    ("hmm",       "hmm_lean"),
+                    ("hawkes",    "hawkes"),       ("ou",        "ou_dir"),
+                    ("hurst",     "hurst_signal"), ("arfima",    "arfima_bias"),
+                    ("kalman",    "kalman"),       ("copula",    "copula_agree"),
+                    ("vol_trust", "vol_trust"),    ("entropy",   "entropy_trust"),
+                    ("rsi",       "rsi_signal"),   ("srsi",      "srsi_signal"),
+                    ("adx",       "adx_dir"),      ("boll",      "boll_signal"),
+                    ("zscore",    "z_signal"),     ("te",        "te_signal"),
+                    ("jump",      "jump_dir"),     ("post_jump", "post_jump"),
+                ]:
+                    val = feats.get(key)
+                    if val is not None:
+                        layer_outcomes[layer].append((float(val), actual_mid))
+
+        if total_fold > 0:
+            per_fold_hit_rates.append((fold, train_end, total_fold, hits_fold / total_fold))
+
+    if not per_fold_hit_rates:
+        return None
+
+    fold_hrs = [x[3] for x in per_fold_hit_rates]
+    per_duration_win_rates = {
+        dur: wins / total if total > 0 else 0.5
+        for dur, (wins, total) in per_duration_outcomes.items()
+    }
+    per_layer_correlations = {}
+    for layer, pairs in layer_outcomes.items():
+        if len(pairs) < 20:
+            continue
+        vals     = np.array([p[0] for p in pairs])
+        outcomes = np.array([1 if p[1] > 0 else 0 for p in pairs])
+        if np.std(vals) > 0:
+            per_layer_correlations[layer] = float(np.corrcoef(vals, outcomes)[0, 1])
+
+    best_models = fit_symbol_models(sd)
+
+    return {
+        "per_fold_hit_rates":      per_fold_hit_rates,
+        "per_duration_win_rates":  per_duration_win_rates,
+        "per_layer_correlations":  per_layer_correlations,
+        "mean_hit_rate":           float(np.mean(fold_hrs)),
+        "std_hit_rate":            float(np.std(fold_hrs)),
+        "all_confidences":         all_confidences,
+        "all_p_ups":               all_p_ups,      # v3: for confidence calibration
+        "all_outcomes":            all_outcomes,    # v3: for confidence calibration
+        "best_models":             best_models,
+        "is_tradeable":            float(np.mean(fold_hrs)) >= 0.46 and best_models.fitted,
+        "n_folds_completed":       len(per_fold_hit_rates),
+    }
+
+
+def check_model_stability(models, symbol):
+    """Audit fitted model parameters for physical sanity. Returns a list of
+    warning strings (empty = clean)."""
+    warns = []
+    if models.garch_result is not None:
+        try:
+            p = models.garch_result.params
+            alpha = p.get("alpha[1]", p.get("alpha", None))
+            beta  = p.get("beta[1]",  p.get("beta",  None))
+            if alpha is not None and beta is not None:
+                persistence = float(alpha) + float(beta)
+                if persistence >= 1.0:
+                    warns.append(f"GARCH persistence={persistence:.3f} >= 1.0 (non-stationary)")
+                elif persistence > 0.98:
+                    warns.append(f"GARCH persistence={persistence:.3f} near-unit-root")
+        except Exception:
+            pass
+    for label, h in [("up", models.hawkes_up), ("down", models.hawkes_down)]:
+        if h is not None:
+            alpha, beta = h.get("alpha", 0), h.get("beta", 1)
+            ratio = alpha / beta if beta > 0 else 999
+            if ratio >= 1.0:
+                warns.append(f"Hawkes {label}: branching ratio={ratio:.3f} >= 1.0 (explosive)")
+            elif ratio > 0.9:
+                warns.append(f"Hawkes {label}: branching ratio={ratio:.3f} near-critical")
+    if models.ou_params is not None:
+        theta = models.ou_params.get("theta", 0)
+        if theta <= 0:
+            warns.append(f"OU theta={theta:.4f} <= 0 (divergent)")
+    if models.hmm_model is not None:
+        try:
+            # FIX v2: fit_hmm() now actively avoids degenerate states via
+            # multi-seed fitting + automatic 2-state fallback, so this should
+            # rarely fire anymore. Kept as a safety-net diagnostic — if it
+            # still appears in logs after the fix, the fallback chain itself
+            # failed and is worth investigating directly.
+            for i, p in enumerate(models.hmm_model.get_stationary_distribution()):
+                if p < 0.05:
+                    warns.append(f"HMM state {i} stationary prob={p:.3f} (degenerate)")
+        except Exception:
+            pass
+    return warns
+
+
+async def deep_startup_calibration(state, symbol_data, symbols):
+    """Full-power startup calibration. Every symbol, every layer, no shortcuts.
+    Called ONCE before the bot places any trade. Periodic run_calibration()
+    continues every 2 hours and on loss triggers - those are lighter (top-K).
+    This is the one time with no time pressure, so we use it fully."""
+    state.trading_locked = True
+    start = time.time()
+    print("=" * 60)
+    print("DEEP STARTUP CALIBRATION — full power, all symbols")
+    print("=" * 60)
+
+    all_confidences = []
+    symbol_reports  = {}
+
+    for s in symbols:
+        sd = symbol_data[s]
+        n  = len(sd.ticks)
+        fam = "1HZ" if "1HZ" in s else "R_ "
+        print(f"\n[DeepCal] [{fam}] {s}: {n} ticks  tick_dt={sd.tick_dt:.1f}s — "
+              f"starting {5}-fold expanding walk-forward...")
+
+        if n < MIN_TICKS_FOR_FIT * 2 + 100:
+            print(f"[DeepCal] {s}: insufficient history, skipping.")
+            state.reliability[s] = 0.3
+            continue
+
+        # FIX v2: 3 folds + step=5 cuts calibration time from 688s to ~200s
+        # (40% fewer folds × 40% fewer test-window re-fits) with no meaningful
+        # loss of calibration accuracy on 10k-tick synthetic index histories.
+        report = expanding_window_walk_forward(sd, n_folds=3,
+                                               horizons=CANDIDATE_DURATIONS, step=5)
+        if report is None:
+            print(f"[DeepCal] {s}: walk-forward returned no result. Not tradeable.")
+            state.reliability[s] = 0.3
+            continue
+
+        stability_warns = check_model_stability(report["best_models"], s)
+
+        print(f"[DeepCal] {s}: {report['n_folds_completed']}/3 folds")
+        print(f"  Mean OOS hit rate : {report['mean_hit_rate']:.3f}  (std={report['std_hit_rate']:.3f})")
+        print(f"  Per-fold          : {[f'f{x[0]}={x[3]:.3f}' for x in report['per_fold_hit_rates']]}")
+        print(f"  Per-duration win% : { {d: f'{v:.3f}' for d,v in sorted(report['per_duration_win_rates'].items())} }")
+        print(f"  Layer correlations: { {l: f'{v:+.3f}' for l,v in sorted(report['per_layer_correlations'].items(), key=lambda x: abs(x[1]), reverse=True)} }")
+        print(f"  Is tradeable      : {report['is_tradeable']}  (mean hit rate >= 0.46)")
+        if stability_warns:
+            print(f"  *** STABILITY WARNINGS ***")
+            for w in stability_warns:
+                print(f"      {w}")
+        else:
+            print(f"  Model stability   : CLEAN")
+
+        if report["best_models"] is not None and report["best_models"].fitted:
+            m = report["best_models"]
+            m.empirical_duration_win_rates = report["per_duration_win_rates"]
+
+            # ── Convert OOS per-layer correlations → fusion weights ────────
+            # Correlation with realized outcome tells us how much each layer
+            # actually predicts direction on THIS specific symbol. We scale
+            # it into a positive weight: perfectly correlated layer gets 2x
+            # its static default, uncorrelated gets 0.1x (not zero — avoids
+            # a layer being silenced on a short OOS window that may be noisy).
+            corr = report["per_layer_correlations"]
+            if corr:
+                learned_w = {}
+                for layer, c in corr.items():
+                    # abs(corr) in [0,1] → weight in [0.1, 2.0]
+                    learned_w[layer] = float(np.clip(0.1 + abs(c) * 1.9, 0.1, 2.0))
+                    # preserve sign: if layer is negatively correlated, flip
+                    # its evidence contribution (handled in bayesian_fusion via
+                    # the weight staying positive but the signal itself carrying
+                    # direction - weight scales magnitude only)
+                m.per_layer_weights = learned_w
+                top3 = sorted(corr.items(), key=lambda x: abs(x[1]), reverse=True)[:3]
+                print(f"  Learned weights   : top-3 predictors = "
+                      f"{[(l, f'{c:+.3f}') for l,c in top3]}")
+            else:
+                m.per_layer_weights = None
+                print(f"  Learned weights   : insufficient OOS data, using static defaults")
+
+            state.model_cache[s] = m
+
+            # v9: fit the parallel MINUTE-bar model stack too, so the
+            # minute-native gate pipeline (try_minute_gates_candidate())
+            # has something to work with from the very first calibration
+            # cycle onward. Non-fatal/silent if there isn't enough minute
+            # history yet -- that symbol just falls back to tick-native
+            # gates until a later calibration cycle has more minute bars
+            # buffered.
+            minute_m = fit_minute_models_for_symbol(sd)
+            if minute_m is not None:
+                state.minute_model_cache[s] = minute_m
+                print(f"  Minute model      : fitted ({len(sd.minute_bar_prices())} bars)")
+            else:
+                state.minute_model_cache.pop(s, None)
+                print(f"  Minute model      : not enough minute bars yet")
+
+            # ── Warm-start: blend Supabase-persisted weights ───────────────
+            pending = state._pending_weights.get(s)
+            if pending:
+                if m.per_layer_weights is None:
+                    m.per_layer_weights = pending
+                    print(f"  Warm weights      : restored from Supabase (no OOS weights this run)")
+                else:
+                    all_keys = set(m.per_layer_weights) | set(pending)
+                    m.per_layer_weights = {
+                        k: round(0.7 * m.per_layer_weights.get(k, 1.0)
+                                 + 0.3 * pending.get(k, 1.0), 6)
+                        for k in all_keys
+                    }
+                    print(f"  Warm weights      : blended OOS 70% + Supabase prior 30%")
+
+        state.reliability[s] = float(np.clip(report["mean_hit_rate"] / 0.5, 0.3, 1.5))
+        symbol_reports[s]    = report
+
+        # ── Per-symbol threshold from THIS symbol's OOS confidence distribution
+        # Each symbol gets its own threshold derived from its own OOS confidence
+        # scores, not a pooled global number.
+        # FIX v3: Scale the threshold by the symbol's reliability score.
+        # Previously ALL symbols used ADAPTIVE_THRESHOLD_PERCENTILE=75 regardless
+        # of reliability. A low-reliability symbol (e.g. 0.3-0.6) that produces
+        # naturally noisy confidence scores ended up with a threshold it could
+        # never clear in live trading — confirmed: 6 of 8 symbols showed zero
+        # trades despite showing '8/8 ready' in the heartbeat. Now the percentile
+        # is inversely scaled by reliability: a very reliable symbol (1.2) still
+        # uses the 75th percentile bar; a low-reliability symbol (0.3) uses the
+        # 40th percentile bar — letting it compete at all rather than being
+        # silently frozen out by an impossible threshold.
+        sym_rel = state.reliability.get(s, 1.0)
+        rel_scaled_pct = int(np.clip(
+            ADAPTIVE_THRESHOLD_PERCENTILE * (sym_rel / 1.0),
+            35, ADAPTIVE_THRESHOLD_PERCENTILE
+        ))
+        sym_confidences = report["all_confidences"]
+        if sym_confidences:
+            sym_thr = float(np.clip(
+                np.percentile(sym_confidences, rel_scaled_pct), 0.015, 0.55))
+            pct_clr = float(np.mean(np.array(sym_confidences) >= sym_thr))
+            # Safety valve: if still starved, drop further
+            if pct_clr < 0.10:
+                sym_thr = float(np.percentile(sym_confidences,
+                                              max(rel_scaled_pct - 15, 25)))
+                pct_clr = float(np.mean(np.array(sym_confidences) >= sym_thr))
+            elif pct_clr > 0.60:
+                sym_thr = float(np.percentile(sym_confidences,
+                                              min(rel_scaled_pct + 10, 80)))
+                pct_clr = float(np.mean(np.array(sym_confidences) >= sym_thr))
+            state.per_symbol_threshold[s] = sym_thr
+            print(f"  Per-symbol thr    : {sym_thr:.4f}  "
+                  f"({pct_clr*100:.0f}% OOS points clear, "
+                  f"pct={rel_scaled_pct}, rel={sym_rel:.2f})")
+        else:
+            # No OOS confidence data — use a conservative fraction of the global
+            # threshold rather than the full bar which this symbol can't clear
+            state.per_symbol_threshold[s] = state.adaptive_threshold * max(sym_rel, 0.5)
+
+        all_confidences.extend(sym_confidences)
+        print(f"  Reliability       : {state.reliability[s]:.3f}")
+
+    if all_confidences:
+        global_thr = float(np.clip(
+            np.percentile(all_confidences, ADAPTIVE_THRESHOLD_PERCENTILE), 0.03, 0.6))
+        state.adaptive_threshold = global_thr   # global fallback only
+        print(f"\n[DeepCal] Global fallback threshold -> {global_thr:.4f} "
+              f"(per-symbol thresholds take precedence when set)")
+    else:
+        print(f"\n[DeepCal] WARNING: no confidence samples — keeping default "
+              f"threshold={state.adaptive_threshold:.3f}")
+
+    tradeable     = [s for s,r in symbol_reports.items() if r["is_tradeable"]]
+    not_tradeable = [s for s,r in symbol_reports.items() if not r["is_tradeable"]]
+    print(f"\n[DeepCal] TRADEABLE ({len(tradeable)}): {tradeable}")
+    print(f"[DeepCal] BELOW EDGE BAR ({len(not_tradeable)}): {not_tradeable}")
+    print(f"[DeepCal] Below-bar symbols still compete via ensemble — "
+          f"lower reliability multiplier means they need a stronger signal to win selection.")
+
+    elapsed = time.time() - start
+    print(f"\n[DeepCal] Complete in {elapsed:.1f}s ({elapsed/60:.1f} min). Bot armed.")
+    print("=" * 60)
+
+    state.last_scheduled_calibration = time.time()
+    state.last_calibration_end       = time.time()
+    state.last_activity              = time.time()
+    state.trading_locked             = False
+
+    # ── v3: Post-calibration snapshots and self-improvement ───────────────
+    for s, report in symbol_reports.items():
+        models = state.model_cache.get(s)
+        if models is None or not models.fitted:
+            continue
+        sd = symbol_data.get(s)
+        if sd is None:
+            continue
+
+        # 1. Confidence calibration: fit temperature + isotonic from OOS data.
+        #    Uses the OOS p_up values and actual hit outcomes from walk-forward.
+        #    MUST run BEFORE the drift snapshot below -- fuse_signal() always
+        #    returns a CALIBRATED confidence (it calls ConfidenceCalibrator.
+        #    calibrate() before recomputing confidence), so the live PSI
+        #    check in check_psi() is always comparing calibrated numbers.
+        #    Fitting first lets step 2 build a reference from the same
+        #    calibrated distribution instead of the raw one.
+        raw_pups    = report.get("all_p_ups",    [])
+        raw_outcomes= report.get("all_outcomes", [])
+        if len(raw_pups) >= 50 and len(raw_outcomes) >= 50:
+            ConfidenceCalibrator.fit_and_save(
+                state, s,
+                raw_pups[:len(raw_outcomes)],
+                raw_outcomes
+            )
+
+        # 2. Drift detector: snapshot training distribution as new reference.
+        #    BUGFIX: this used to snapshot report["all_confidences"] directly,
+        #    which are raw/uncalibrated (bayesian_fusion() output from the
+        #    walk-forward eval loop, before any calibration is applied). But
+        #    check_psi() always feeds it fuse_signal()'s CALIBRATED confidence
+        #    live. Comparing a raw reference against a calibrated live stream
+        #    is comparing two different quantities -- PSI reads "shifted"
+        #    almost every cycle regardless of real drift, which is what kept
+        #    locking trading for ~10min at a time back-to-back in production.
+        #    Fix: re-express each OOS confidence in calibrated terms before
+        #    snapshotting. confidence = |p - 0.5| * 2 * trust, so
+        #    trust = raw_conf / (|p_raw - 0.5| * 2); substituting into
+        #    confidence_cal = |p_cal - 0.5| * 2 * trust cancels both factors
+        #    of 2 exactly, leaving confidence_cal = raw_conf * |p_cal - 0.5|
+        #    / |p_raw - 0.5| -- NOT divided by 2 again. (An earlier version
+        #    of this fix kept a stray *2 in the denominator, which silently
+        #    halved every reference value relative to what fuse_signal()
+        #    actually produces live.)
+        train_returns = sd.returns()
+        oos_confs_raw = report.get("all_confidences", [])
+        oos_pups_raw  = report.get("all_p_ups", [])
+        oos_confs = []
+        for c_raw, p_raw in zip(oos_confs_raw, oos_pups_raw):
+            denom = abs(p_raw - 0.5)
+            if denom < 1e-9:
+                oos_confs.append(c_raw)
+                continue
+            p_cal = ConfidenceCalibrator.calibrate(p_raw, state, s)
+            oos_confs.append(c_raw * abs(p_cal - 0.5) / denom)
+        DriftDetector.snapshot_reference(state, s, train_returns, oos_confs)
+
+        # 3. Meta-learner: batch retrain from full rolling buffer
+        MetaLearner.retrain_from_buffer(state, s)
+
+    # ── Persist learned state to Supabase ─────────────────────────────────
+    if _store is not None:
+        _store.save_symbol_state(state)
+        _store.save_global_state(state)
+        _store.save_gates(MIN_LAYER_AGREE, MAX_LAYER_DISAGREE,
+                          MIN_EXP_WIN_RATE, state.adaptive_threshold)
+    autotune_gates(state)
+
+
+async def run_calibration(state, symbol_data, symbols, trigger_reason):
+    state.trading_locked = True
+    kind, loss_symbol = trigger_reason
+    start = time.time()
+    # loss_symbol's shape depends on `kind`: check_calibration_triggers()
+    # returns ("drift", [list of flagged symbols]) or ("scheduled", None) --
+    # never a single bare string, despite what this print used to assume
+    # (`':' + loss_symbol`, which crashed with a TypeError on every single
+    # drift-triggered recalibration: "can only concatenate str (not 'list')
+    # to str"). Handle every shape this can actually take.
+    if loss_symbol:
+        detail = ':' + (','.join(loss_symbol) if isinstance(loss_symbol, (list, tuple))
+                        else str(loss_symbol))
+    else:
+        detail = ''
+    print(f"[Calibrator] starting (trigger={kind}{detail}). Trading locked.")
+
+    if kind == "loss_triggered":
+        state.loss_triggered_calibrations_24h.append(start)
+
+    # Always recalibrate ALL symbols — both scheduled (2-hour) and initial runs
+    # use the full universe so thresholds and reliability scores reflect every
+    # available symbol, not just the top-K from an entropy pre-scan.
+    candidates = symbols
+
+    all_confidences = []
+    for s in candidates:
+        sd = symbol_data[s]
+        if len(sd.ticks) < MIN_TICKS_FOR_FIT + 100:
+            print(f"[Calibrator] {s}: not enough ticks yet, skipping this cycle.")
+            continue
+        # v15: per-step timing so a slow cycle can be attributed to a
+        # specific stage instead of guessed at. Per-symbol walk-forward cost
+        # was observed to roughly double between two otherwise-identical
+        # runs (no code change touched either of these two calls) -- this
+        # will show whether it's inside walk_forward_validate (and if so,
+        # its own fit_s/replay_s breakdown further narrows it), the minute
+        # model fit, or something environmental (e.g. Railway CPU
+        # contention) that doesn't show up as wall-clock inside either call.
+        _t_wf = time.time()
+        hit_rate, models, confidences, wf_timing = walk_forward_validate(sd)
+        _t_wf_done = time.time()
+        if models is not None:
+            # Blend in Supabase-persisted weights as warm-start
+            pending = state._pending_weights.get(s)
+            if pending:
+                if models.per_layer_weights is None:
+                    models.per_layer_weights = pending
+                else:
+                    all_keys = set(models.per_layer_weights) | set(pending)
+                    models.per_layer_weights = {
+                        k: round(0.7 * models.per_layer_weights.get(k, 1.0)
+                                 + 0.3 * pending.get(k, 1.0), 6)
+                        for k in all_keys
+                    }
+            state.model_cache[s] = models
+
+            # v9: same parallel minute-bar model fit as deep_startup_
+            # calibration -- keeps the minute-native gate pipeline's
+            # models fresh on every recalibration cycle too, not just at
+            # startup.
+            minute_m = fit_minute_models_for_symbol(sd)
+            if minute_m is not None:
+                state.minute_model_cache[s] = minute_m
+            else:
+                state.minute_model_cache.pop(s, None)
+        _t_minute_done = time.time()
+        state.reliability[s] = float(np.clip(hit_rate / 0.5, 0.3, 1.5))
+        state.consecutive_losses[s] = 0
+        all_confidences.extend(confidences)
+        print(f"[Calibrator] {s}: walk-forward hit_rate={hit_rate:.3f} reliability={state.reliability[s]:.2f} "
+              f"n_confidence_samples={len(confidences)} "
+              f"[timing: walk_forward={_t_wf_done-_t_wf:.1f}s "
+              f"(fit={wf_timing.get('fit_s', 0):.1f}s replay={wf_timing.get('replay_s', 0):.1f}s "
+              f"n_replayed={wf_timing.get('n_replayed', 0)}) "
+              f"minute_fit={_t_minute_done-_t_wf_done:.1f}s]")
+
+    if all_confidences:
+        new_threshold = float(np.percentile(all_confidences, ADAPTIVE_THRESHOLD_PERCENTILE))
+        # never let the bar collapse to ~0 (untradeable noise floor) or demand
+        # near-impossible confidence - keep it in a sane band regardless of
+        # what the percentile math produces on a weird sample
+        new_threshold = float(np.clip(new_threshold, 0.03, 0.6))
+        old_threshold = state.adaptive_threshold
+        state.adaptive_threshold = new_threshold
+        pct_clearing = float(np.mean(np.array(all_confidences) >= new_threshold)) * 100
+        print(f"[Calibrator] adaptive_threshold {old_threshold:.3f} -> {new_threshold:.3f} "
+              f"(P{ADAPTIVE_THRESHOLD_PERCENTILE} of {len(all_confidences)} samples, "
+              f"~{pct_clearing:.0f}% of replayed points would clear it)")
+    else:
+        print(f"[Calibrator] no confidence samples collected this cycle - "
+              f"keeping threshold at {state.adaptive_threshold:.3f}")
+
+    state.last_scheduled_calibration = time.time()
+    state.last_calibration_end = time.time()
+    state.last_activity = time.time()
+
+    # v14: surface conviction_outcome_report() every cycle instead of never.
+    # regime_conviction.py's own docstring calls the conviction->win-rate
+    # correlation "the whole approach's unproven assumption" that "SHOULD be
+    # measured before raising max_mult" -- but nothing in the bot ever
+    # called this, and until the conviction column/threading fix above,
+    # there was no scored data for it to read anyway. Printed here (not
+    # gated on a minimum count) so early cycles visibly say "not enough
+    # data yet" rather than silently never running.
+    if _store is not None:
+        scored_trades = _store.fetch_scored_trades()
+        print(f"\n[ConvictionCheck] {conviction_outcome_report(scored_trades)}\n")
+
+    print(f"[Calibrator] complete in {state.last_calibration_end - start:.1f}s. Updated: {candidates}")
+    state.trading_locked = False
+
+    # ── Persist learned state to Supabase ─────────────────────────────────
+    if _store is not None:
+        _store.save_symbol_state(state)
+        _store.save_global_state(state)   # FIX v2: persist direction_history
+        _store.save_gates(MIN_LAYER_AGREE, MAX_LAYER_DISAGREE,
+                          MIN_EXP_WIN_RATE, state.adaptive_threshold)
+    autotune_gates(state)
+
+    # v7: pick up any fresher LSTM state_dicts the trainer has uploaded
+    # since the last calibration. Piggy-backed here (rather than a separate
+    # timer) so it only ever runs while state.trading_locked was True for
+    # this whole function -- never mid-trade.
+    maybe_reload_lstm_models()
+
+
+# ---------------------------------------------------------------------------
+# STREAM CONSUMERS
+# ---------------------------------------------------------------------------
+async def tick_consumer(queue, symbol_data, state):
+    while True:
+        data = await queue.get()
+        tick = data.get("tick")
+        if not tick:
+            continue
+        symbol = tick.get("symbol")
+        if symbol in symbol_data:
+            symbol_data[symbol].add_tick(tick["epoch"], tick["quote"])
+        state.last_activity = time.time()
+
+
+async def balance_consumer(queue, state):
+    while True:
+        data = await queue.get()
+        bal = data.get("balance")
+        if bal:
+            state.balance = bal["balance"]
+
+
+async def watchdog(state):
+    """If WATCHDOG_TIMEOUT seconds pass with no tick received and no main-loop
+    iteration completed (state.last_activity untouched), the process is
+    assumed locked up. Rather than depending on any specific host's restart
+    policy, this re-execs the current Python process in place - identical
+    behavior on Railway and on a local PC, no external supervisor needed."""
+    while True:
+        await asyncio.sleep(WATCHDOG_CHECK_INTERVAL)
+        idle = time.time() - state.last_activity
+        if idle > WATCHDOG_TIMEOUT:
+            print(f"[Watchdog] No activity for {idle:.0f}s (limit {WATCHDOG_TIMEOUT}s). "
+                  f"Restarting process in place now.")
+            sys.stdout.flush()
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+# ---------------------------------------------------------------------------
+# MAIN
+# ---------------------------------------------------------------------------
+async def main():
+    if not DERIV_API_TOKEN:
+        raise RuntimeError("Set the DERIV_API_TOKEN environment variable.")
+    if not DERIV_APP_ID:
+        raise RuntimeError(
+            "Set the DERIV_APP_ID environment variable to your app_id from "
+            "developers.deriv.com. Legacy app_ids (e.g. the old demo id "
+            "1089) do NOT work with the new Options API."
+        )
+    if DERIV_ACCOUNT_TYPE not in ("demo", "real"):
+        raise RuntimeError("DERIV_ACCOUNT_TYPE must be 'demo' or 'real'.")
+    if DERIV_ACCOUNT_TYPE == "real":
+        print("!" * 72)
+        print("! DERIV_ACCOUNT_TYPE=real - this bot will trade with REAL MONEY.    !")
+        print("! Set DERIV_ACCOUNT_TYPE=demo (or unset it) to use a demo account.  !")
+        print("!" * 72)
+
+    client = DerivClient(
+        DERIV_APP_ID, DERIV_API_TOKEN,
+        account_type=DERIV_ACCOUNT_TYPE, account_id=DERIV_ACCOUNT_ID,
+    )
+    account = await client.connect()
+    print(f"Authorized as {account.get('loginid')}")
+
+    state = TradeState()
+    state.balance = account.get("balance", 0.0)
+    print(f"Starting balance: {state.balance}")
+
+    # ── Supabase: init store and warm-start from persisted state ──────────
+    global _store, MIN_LAYER_AGREE, MAX_LAYER_DISAGREE, MIN_EXP_WIN_RATE
+    _store = SupabaseStore()
+    _store.load_symbol_state(state)
+    _store.load_global_state(state)   # FIX v2: restore direction_history
+    gates = _store.load_gates()
+    if gates:
+        MIN_LAYER_AGREE    = int(gates.get("min_layer_agree",    MIN_LAYER_AGREE))
+        MAX_LAYER_DISAGREE = int(gates.get("max_layer_disagree", MAX_LAYER_DISAGREE))
+        MIN_EXP_WIN_RATE   = float(gates.get("min_exp_win_rate", MIN_EXP_WIN_RATE))
+        state.adaptive_threshold = float(gates.get("adaptive_threshold", state.adaptive_threshold))
+        print(f"[Store] Restored gates: agree>={MIN_LAYER_AGREE} "
+              f"disagree<={MAX_LAYER_DISAGREE} MC>={MIN_EXP_WIN_RATE:.2f} "
+              f"thr={state.adaptive_threshold:.4f}")
+
+    # v7: pull whatever RISEFALL LSTM state_dicts risefall_lstm_train.py has
+    # already uploaded. Missing/stale rows are non-fatal -- Gate 6 just
+    # stays inactive until the trainer's next run populates them.
+    maybe_reload_lstm_models(force=True)
+
+    # --- R_ symbols ---
+    r_symbols = []
+    for attempt in range(1, 6):
+        if SYMBOLS_OVERRIDE:
+            r_symbols = [x for x in SYMBOLS_OVERRIDE if not x.startswith("1HZ")]
+            break
+        r_symbols = await fetch_tradable_symbols(client)
+        if r_symbols:
+            break
+        print(f"[main] No R_ symbols on attempt {attempt}/5, retrying in 3s...")
+        await asyncio.sleep(3)
+    if not r_symbols and not SYMBOLS_OVERRIDE:
+        raise RuntimeError("No R_ rise/fall symbols found (check API credentials/connectivity).")
+
+    # --- top-3 1HZ symbols by tick consistency ---
+    hz_symbols = []
+    for attempt in range(1, 4):
+        if SYMBOLS_OVERRIDE:
+            hz_symbols = [x for x in SYMBOLS_OVERRIDE if x.startswith("1HZ")]
+            break
+        hz_symbols = await select_top_1hz(client, n_top=3)
+        if hz_symbols:
+            break
+        print(f"[main] No 1HZ symbols on attempt {attempt}/3, retrying in 3s...")
+        await asyncio.sleep(3)
+    if not hz_symbols and not SYMBOLS_OVERRIDE:
+        print("[main] WARNING: no 1HZ symbols available - proceeding with R_ only.")
+
+    symbols = r_symbols + hz_symbols
+    print(f"\nFull tradable universe ({len(symbols)} symbols):")
+    print(f"  R_ ({len(r_symbols)}): {r_symbols}")
+    print(f"  1HZ top-3 ({len(hz_symbols)}): {hz_symbols}")
+
+    # build SymbolData with correct tick_dt per family
+    symbol_data = {}
+    for s in r_symbols:
+        symbol_data[s] = SymbolData(s, tick_dt=2.0)   # R_ tick ~every 2s
+    for s in hz_symbols:
+        symbol_data[s] = SymbolData(s, tick_dt=1.0)   # 1HZ ticks every 1s
+
+    print(f"Bootstrapping tick history for all symbols (target: {HISTORY_BOOTSTRAP_COUNT} ticks each)...")
+    for s in symbols:
+        history = await fetch_history(client, s)
+        for epoch, price in history:
+            symbol_data[s].add_tick(epoch, price)
+        actual_dt = symbol_data[s].mean_tick_dt()
+        n = len(symbol_data[s].ticks)
+        span_hrs = (n * actual_dt) / 3600
+        print(f"  {s}: {n} ticks loaded  actual_mean_dt={actual_dt:.2f}s  span≈{span_hrs:.1f}h")
+
+    tick_queue = client.subscribe_channel("tick")
+    balance_queue = client.subscribe_channel("balance")
+
+    async def subscribe_all(c):
+        """Replays balance + per-symbol tick subscriptions. Used for the
+        initial subscribe and re-run as `resubscribe_cb` after every
+        reconnect (a fresh OTP session has no memory of prior subscriptions)."""
+        await c.send({"balance": 1, "subscribe": 1})
+        for s in symbols:
+            await c.send({"ticks": s, "subscribe": 1})
+
+    client.resubscribe_cb = subscribe_all
+    await subscribe_all(client)
+
+    asyncio.create_task(tick_consumer(tick_queue, symbol_data, state))
+    asyncio.create_task(balance_consumer(balance_queue, state))
+    asyncio.create_task(watchdog(state))
+
+    print("Running initial full-power calibration across the entire universe before trading begins...")
+    await deep_startup_calibration(state, symbol_data, symbols)
+
+    print("Bot running. Entering main decision loop.")
+    last_heartbeat = 0.0
+
+    while True:
+        await asyncio.sleep(2)
+        state.last_activity = time.time()
+
+        if state.trading_locked or state.trade_in_progress:
+            continue
+
+        trigger = check_calibration_triggers(state)
+        if trigger:
+            await run_calibration(state, symbol_data, symbols, trigger)
+            continue
+
+        ready_symbols = [s for s in symbols
+                         if s in state.model_cache
+                         and len(symbol_data[s].ticks) >= MIN_TICKS_LIVE]
+
+        now = time.time()
+        if now - last_heartbeat > 30:
+            rec = ((" | RECOVERY " + ", ".join(
+                        f"{sym}:step={slot['step']}/${slot['stake']:.2f}"
+                        for sym, slot in state.recovery.items()))
+                   if state.recovery else "")
+            s0_parts = []
+            for sym in ready_symbols:
+                tot = state.step0_total[sym]
+                if tot > 0:
+                    wr = state.step0_wins[sym] / tot
+                    s0_parts.append(f"{sym}:{wr:.0%}({tot})")
+            s0_str = " s0_wr=[" + " ".join(s0_parts) + "]" if s0_parts else ""
+            print(f"[scan] balance={state.balance:.2f} | "
+                  f"{len(ready_symbols)}/{len(symbols)} ready{rec}{s0_str}")
+            last_heartbeat = now
+            # FIX v3: persist direction_history every heartbeat cycle so the
+            # bias-correction window survives Railway restarts reliably rather
+            # than only being saved when a trade closes (which gave only 3
+            # entries in the global_state table after a full session).
+            if _store is not None and len(state.direction_history) > 0:
+                _store.save_global_state(state)
+
+        if not ready_symbols:
+            continue
+
+        returns_window_dict = {s: symbol_data[s].returns()[-200:] for s in ready_symbols}
+        # v9: minute-bar analog, for copula_agreement() inside
+        # compute_features() when called against a MinuteBarView. Built
+        # once per outer-loop iteration here (not per-symbol inside the
+        # gate closures below) since copula_agreement needs every ready
+        # symbol's series at once, same reasoning as the tick version
+        # above. Symbols with too little minute history simply won't
+        # have an entry -- copula_agreement() already tolerates a
+        # smaller cross-symbol set.
+        minute_returns_window_dict = {}
+        for s in ready_symbols:
+            mv_s = MinuteBarView(symbol_data[s], max_bars=201)
+            if mv_s.has_data(30):
+                minute_returns_window_dict[s] = mv_s.returns()[-200:]
+
+        # ── RECOVERY MODE ────────────────────────────────────────────────────
+        # No symbol, direction, or duration lock on WHICH symbol EXECUTES a
+        # recovery trade -- same "best signal from ANY symbol in ANY
+        # direction wins" search as before. What IS per-symbol (v12) is the
+        # recovery OBLIGATION: state.recovery is keyed by the ORIGINATING
+        # symbol whose step=0 loss armed it, so two symbols losing in the
+        # same cycle each get an independent slot instead of one clobbering
+        # the other's step/stake. Recovering symbols no longer pause ALL
+        # other trading system-wide either -- they're excluded from the
+        # NORMAL scan below (see "s in state.recovery" there) until their
+        # own recovery clears, but other symbols keep scanning/allocating
+        # normally in this same cycle. If more than one slot is active and
+        # they share the same best signal (likely -- it's one shared scan),
+        # they each fire their own concurrent contract on that same
+        # symbol/direction, sized to their own step/stake -- independent
+        # recovery attempts, not one trade split between them.
+        active_recovery_symbols = list(state.recovery.keys())
+        if active_recovery_symbols:
+            # Run the full symbol scan using fresh post-recal models
+            rec_scores = {}
+            for s in ready_symbols:
+                sd    = symbol_data[s]
+                feats = compute_features(sd, state.model_cache.get(s), returns_window_dict)
+                if feats is None:
+                    continue
+                p_up, confidence = fuse_signal(feats, state, s)   # v3: meta-learner path
+                rec_scores[s] = (p_up, confidence)
+
+            # v10: try_tick_recovery_candidate() (the old tick-based
+            # select_trade + Gates 5/6/1 pipeline) has been removed
+            # entirely -- this bot is minutes-only now, with no tick
+            # fallback anywhere. rec_scores above is now only used as a
+            # lightweight cross-symbol confidence reference; the real
+            # decision comes from try_minute_gates_recovery_candidate()
+            # and try_lstm_standalone_recovery() below.
+
+            def try_lstm_standalone_recovery():
+                """Scans every ready symbol's LSTM ensemble independently
+                of the gate pipelines above and returns the single
+                best-by-edge MINUTE-duration candidate that clears
+                LSTM_MIN_EDGE_STANDALONE, or None. v10: tick-duration LSTM
+                picks are skipped entirely in this loop (not just filtered
+                after) -- a lower-edge minute candidate on one symbol must
+                still be preferred over a higher-edge tick candidate on
+                another, since tick is no longer a fallback, it's simply
+                not eligible."""
+                best_sym, best_cand = None, None
+                for s in ready_symbols:
+                    cand = lstm_evaluate(symbol_data[s])
+                    if (cand is None or cand["duration_unit"] != "m"
+                            or cand["edge"] < LSTM_MIN_EDGE_STANDALONE):
+                        continue
+                    if best_cand is None or cand["edge"] > best_cand["edge"]:
+                        best_sym, best_cand = s, cand
+                if best_cand is None:
+                    return None
+                # Minute-native feats for explain_signal()'s display, when
+                # available -- falls back to tick feats only for logging
+                # purposes (Gates 1-5 never gate this trade either way).
+                mv_l = MinuteBarView(symbol_data[best_sym])
+                m_models_l = state.minute_model_cache.get(best_sym)
+                if mv_l.has_data(60) and m_models_l is not None:
+                    feats_l = compute_features(mv_l, m_models_l, minute_returns_window_dict)
+                else:
+                    feats_l = compute_features(symbol_data[best_sym], state.model_cache.get(best_sym),
+                                               returns_window_dict)
+                return {
+                    "source": "lstm_standalone", "symbol": best_sym,
+                    "direction": best_cand["direction"], "p_up": best_cand["p"],
+                    "confidence": min(1.0, best_cand["edge"] * 2.0),
+                    "exp_win_rate": best_cand["p"], "rating": best_cand["edge"],
+                    "duration": best_cand["duration"],
+                    "exec_duration": best_cand["duration"], "duration_unit": "m",
+                    "feats": feats_l, "n_agree": None,
+                }
+
+            def try_minute_gates_recovery_candidate():
+                """v9: the minute-native Gates 1-6 + MC pipeline (same one
+                try_minute_gates_candidate() runs in the normal scan loop),
+                scanned across every ready symbol and returning the single
+                best-by-rating qualifying candidate, or None -- recovery's
+                "one best pick across every ready symbol" shape, same
+                adaptation try_lstm_standalone_recovery() above already
+                makes for the LSTM-only path."""
+                best = None
+                for rs in ready_symbols:
+                    sd_m = symbol_data[rs]
+                    mv = MinuteBarView(sd_m)
+                    if not mv.has_data(60):
+                        continue
+                    m_models = state.minute_model_cache.get(rs)
+                    if m_models is None:
+                        continue
+
+                    feats_m = compute_features(mv, m_models, minute_returns_window_dict)
+                    if feats_m is None:
+                        continue
+                    p_up_m, confidence_m = fuse_signal(feats_m, state, rs)
+                    direction_m = 1 if p_up_m > 0.5 else -1
+                    minute_returns = mv.returns()
+
+                    mc_duration_m, exp_win_rate_m = monte_carlo_duration(
+                        mv.prices(), minute_returns, direction_m, feats_m,
+                        CANDIDATE_DURATIONS_MINUTES, models=m_models
+                    )
+                    if exp_win_rate_m < MIN_EXP_WIN_RATE:
+                        # v15 BUGFIX: this was a completely silent reject --
+                        # no print, unlike every other gate in this chain --
+                        # so a candidate could clear regime routing's
+                        # conviction floor (with its own printed stake) and
+                        # then vanish here with zero trace. Confirmed in
+                        # production: 95 of 110 candidates that cleared the
+                        # conviction floor in one session died with no
+                        # visible rejection anywhere in the log. See the
+                        # matching fix at the non-recovery call site below
+                        # for the full rationale.
+                        print(f"[MC/Recovery] {rs} skipped — exp_win_rate="
+                              f"{exp_win_rate_m:.3f} < {MIN_EXP_WIN_RATE} "
+                              f"(regime conviction may have cleared its own "
+                              f"floor upstream; this MC check is independent "
+                              f"and still vetoes)")
+                        continue
+
+                    # v15: MINIMAL_FILTER_MODE skips Gates 1, 4, 6 here too,
+                    # but keeps Gates 2 (entropy), 3 (confluence), and 5
+                    # (advanced HMM/GBM borderline) -- see
+                    # try_minute_gates_candidate()'s matching comment.
+                    if MINIMAL_FILTER_MODE:
+                        pe_ok, _ = entropy_gate_passes(mv.prices())
+                        if not pe_ok:
+                            continue
+                        tf_agree, _ = multi_timeframe_confluence(mv.prices(), direction_m)
+                        if tf_agree < MIN_TF_AGREEMENT:
+                            continue
+                        mc_scan_m = hmm_gbm_scan(mv.prices(), minute_returns, CANDIDATE_DURATIONS_MINUTES,
+                                                 hmm_model=getattr(m_models, "hmm_model", None))
+                        sym_score_m = confidence_m * state.reliability.get(rs, 1.0)
+                        sym_thr_m   = state.per_symbol_threshold.get(rs, state.adaptive_threshold)
+                        if (mc_scan_m["direction"] != direction_m
+                                and sym_score_m < MC_BORDERLINE_MULTIPLIER * sym_thr_m):
+                            continue
+                        rating = abs(float(p_up_m) - 0.5)
+                        if best is None or rating > best["rating"]:
+                            best = {
+                                "source": "minute_gates", "symbol": rs,
+                                "direction": direction_m, "p_up": float(p_up_m),
+                                "confidence": float(confidence_m), "exp_win_rate": float(exp_win_rate_m),
+                                "rating": rating, "duration": mc_duration_m,
+                                "exec_duration": mc_duration_m, "duration_unit": "m",
+                                "feats": feats_m, "n_agree": None,
+                            }
+                        continue
+
+                    gate_ok, n_agree, n_disagree, n_neutral = passes_layer_gate(feats_m, direction_m)
+                    if not gate_ok:
+                        continue
+                    pe_ok, _ = entropy_gate_passes(mv.prices())
+                    if not pe_ok:
+                        continue
+                    tf_agree, _ = multi_timeframe_confluence(mv.prices(), direction_m)
+                    if tf_agree < MIN_TF_AGREEMENT:
+                        continue
+                    bs_agrees, _ = meta_ensemble_agrees(minute_returns, direction_m,
+                                                        mc_duration_m, exp_win_rate_m)
+                    if not bs_agrees:
+                        continue
+
+                    mc_scan_m = hmm_gbm_scan(mv.prices(), minute_returns, CANDIDATE_DURATIONS_MINUTES,
+                                             hmm_model=getattr(m_models, "hmm_model", None))
+                    sym_score_m = confidence_m * state.reliability.get(rs, 1.0)
+                    sym_thr_m   = state.per_symbol_threshold.get(rs, state.adaptive_threshold)
+                    if (mc_scan_m["direction"] != direction_m
+                            and sym_score_m < MC_BORDERLINE_MULTIPLIER * sym_thr_m):
+                        continue
+
+                    lstm_best_m = lstm_evaluate(sd_m)
+                    if lstm_best_m is not None and lstm_best_m["direction"] != direction_m:
+                        continue
+
+                    rating = abs(float(p_up_m) - 0.5)
+                    if best is None or rating > best["rating"]:
+                        best = {
+                            "source": "minute_gates", "symbol": rs,
+                            "direction": direction_m, "p_up": float(p_up_m),
+                            "confidence": float(confidence_m), "exp_win_rate": float(exp_win_rate_m),
+                            "rating": rating, "duration": mc_duration_m,
+                            "exec_duration": mc_duration_m, "duration_unit": "m",
+                            "feats": feats_m, "n_agree": n_agree,
+                        }
+                return best
+
+            # v10: MINUTES ONLY. Same policy as the normal scan loop above
+            # -- if nothing confidently qualifies in minutes this cycle,
+            # recovery WAITS rather than downgrading to a tick trade.
+            minute_gates_candidate = try_minute_gates_recovery_candidate()
+
+            if minute_gates_candidate is not None:
+                chosen = minute_gates_candidate
+                print(f"[Minute/Recovery]: minute-native Gates 1-6 + MC pipeline qualifies "
+                      f"on its own -- {chosen['symbol']} "
+                      f"{'CALL' if chosen['direction']>0 else 'PUT'} (p={chosen['p_up']:.3f} "
+                      f"rating={chosen['rating']:.3f}) -- trading it directly.")
+            else:
+                chosen = try_lstm_standalone_recovery()
+                if chosen is not None:
+                    print(f"[LSTM/Recovery]: minute-priority pick clears the bar on its own -- "
+                          f"{chosen['symbol']} {'CALL' if chosen['direction']>0 else 'PUT'} "
+                          f"(p={chosen['p_up']:.3f} edge={chosen['rating']:.3f}) -- trading it "
+                          f"directly.")
+
+            if chosen is None:
+                # Nothing qualified in minutes this cycle -- every active
+                # slot simply waits. Falls through to NORMAL ENTRY below for
+                # any OTHER (non-recovering) symbol instead of skipping the
+                # whole iteration, unlike the old single-slot version.
+                print(f"[Recovery] {len(active_recovery_symbols)} symbol(s) awaiting recovery "
+                      f"({', '.join(active_recovery_symbols)}) -- nothing qualifies this "
+                      f"cycle, waiting.")
+            else:
+                rec_sym   = chosen["symbol"]
+                rec_dir   = chosen["direction"]
+                duration  = chosen["duration"]
+                feats     = chosen["feats"]
+                rec_exec_duration, rec_exec_unit = chosen["exec_duration"], chosen["duration_unit"]
+                recovery_source = chosen["source"]
+                n_agree = chosen["n_agree"] if chosen["n_agree"] is not None else "n/a"
+
+                print(f"[Recovery] {len(active_recovery_symbols)} slot(s) active "
+                      f"({', '.join(active_recovery_symbols)}) — best signal: {rec_sym} "
+                      f"{'CALL' if rec_dir>0 else 'PUT'} ({n_agree}/16 agree, "
+                      f"exp_win={chosen['exp_win_rate']:.2f}, source={recovery_source})")
+
+                explain_signal(
+                    symbol=rec_sym, direction=rec_dir,
+                    feats=feats, p_up=chosen["p_up"], confidence=chosen["confidence"],
+                    duration=duration, exp_win=chosen["exp_win_rate"], score=chosen["rating"]
+                )
+
+                # v8/v9: ATOMIC final recheck immediately before firing --
+                # done ONCE here, shared by every active slot that fires on
+                # this candidate below, since they're all re-deriving the
+                # identical answer for the identical signal/timestamp --
+                # repeating it once per slot would be pure duplicated work,
+                # not additional safety.
+                if recovery_source == "lstm_standalone":
+                    recheck = lstm_evaluate(symbol_data[rec_sym])
+                    atomic_ok = (recheck is not None and recheck["direction"] == rec_dir
+                                and recheck["edge"] >= LSTM_MIN_EDGE_STANDALONE)
+                    if not atomic_ok:
+                        print(f"[LSTM/Recovery/Atomic] {rec_sym} blocked at execution -- "
+                              f"ensemble's read moved between scan and fire.")
+                    atomic_feats = None
+                elif recovery_source == "minute_gates":
+                    mv_atomic = MinuteBarView(symbol_data[rec_sym])
+                    m_models_atomic = state.minute_model_cache.get(rec_sym)
+                    feats_minute_atomic = (
+                        compute_features(mv_atomic, m_models_atomic, minute_returns_window_dict)
+                        if m_models_atomic is not None and mv_atomic.has_data(60) else None)
+                    atomic_ok = (feats_minute_atomic is not None
+                                and passes_layer_gate(feats_minute_atomic, rec_dir)[0])
+                    if not atomic_ok:
+                        print(f"[Minute/Recovery/Atomic] {rec_sym} blocked at execution -- "
+                              f"minute-native read moved between scan and fire.")
+                    atomic_feats = None
+                else:
+                    atomic_feats = feats
+                    atomic_ok = True
+
+                if atomic_ok:
+                    async def _fire_recovery(origin_symbol):
+                        slot = state.recovery[origin_symbol]
+                        won, _ = await execute_single_step(
+                            client, state, rec_sym, rec_dir,
+                            slot["stake"], slot["step"],
+                            duration=rec_exec_duration, duration_unit=rec_exec_unit,
+                            feats=atomic_feats
+                        )
+                        if won:
+                            print(f"[Recovery] {origin_symbol}'s recovery WON at "
+                                  f"step={slot['step']} via {rec_sym} "
+                                  f"{'CALL' if rec_dir>0 else 'PUT'}.")
+                            state.consecutive_losses[rec_sym] = 0
+                            emit_sequence_summary(state, rec_sym, rec_dir, True)
+                            clear_recovery(state, origin_symbol)
+                        else:
+                            next_step = slot["step"] + 1
+                            cumulative_loss = slot["committed"] + slot["stake"]
+                            next_stake = recovery_stake_for_loss(state, rec_sym, cumulative_loss)
+                            if next_step > MARTINGALE_MAX_STEPS:
+                                print(f"[Recovery] {origin_symbol}'s recovery exhausted "
+                                      f"all {MARTINGALE_MAX_STEPS} steps — closing "
+                                      f"sequence and running deep recalibration.")
+                                state.consecutive_losses[rec_sym] += 1
+                                emit_sequence_summary(state, rec_sym, rec_dir, False)
+                                clear_recovery(state, origin_symbol)
+                                await deep_startup_calibration(state, symbol_data, symbols)
+                            else:
+                                # FIX v2: Sequence loss guard — abort if cumulative
+                                # risk would exceed MAX_SEQUENCE_LOSS_PCT of
+                                # current balance. (Currently unreachable while
+                                # MARTINGALE_MAX_STEPS == 1 -- kept correct for
+                                # if that's ever raised.)
+                                committed = slot["committed"] + slot["stake"]
+                                max_allowed = state.balance * MAX_SEQUENCE_LOSS_PCT
+                                if committed + next_stake > max_allowed:
+                                    print(f"[Recovery] {origin_symbol}'s SEQUENCE LOSS "
+                                          f"GUARD triggered — committed={committed:.2f} "
+                                          f"next={next_stake:.2f} > max={max_allowed:.2f}. "
+                                          f"Aborting sequence to protect balance.")
+                                    emit_sequence_summary(state, rec_sym, rec_dir, False)
+                                    clear_recovery(state, origin_symbol)
+                                else:
+                                    state.recovery[origin_symbol] = {
+                                        "step": next_step, "stake": next_stake,
+                                        "committed": committed,
+                                    }
+                                    print(f"[Recovery] {origin_symbol} step={slot['step']} "
+                                          f"lost on {rec_sym} — next step={next_step} "
+                                          f"stake={next_stake:.2f}")
+                                    # FIX v2: POST_LOSS_DEEP_RECAL is now False — no
+                                    # 688s calibration pause after each recovery
+                                    # step. The scheduled 2-hour recal is sufficient
+                                    # for model freshness.
+                                    if POST_LOSS_DEEP_RECAL:
+                                        await deep_startup_calibration(state, symbol_data, symbols)
+
+                    recovery_results = await asyncio.gather(
+                        *[_fire_recovery(sym) for sym in active_recovery_symbols],
+                        return_exceptions=True
+                    )
+                    for _rsym, _result in zip(active_recovery_symbols, recovery_results):
+                        if isinstance(_result, Exception):
+                            print(f"[Recovery] {_rsym}'s recovery leg raised "
+                                  f"{type(_result).__name__}: {_result} — other "
+                                  f"active slots were unaffected.")
+
+            state.last_activity = time.time()
+            # No `continue` here (v12) -- recovering symbols are excluded
+            # from the NORMAL scan below by symbol membership in
+            # state.recovery, not by skipping this whole iteration, so any
+            # OTHER (non-recovering) symbol still gets evaluated this same
+            # cycle instead of waiting on recovery to clear first.
+
+
+        # ── NORMAL ENTRY ─────────────────────────────────────────────────────
+        # FIX v2: Compute direction balance ratio from recent trade history.
+        # Passed into feats so bayesian_fusion can apply a soft correction
+        # when one direction is systematically over-represented.
+        recent_dirs = state.direction_history[-30:] if state.direction_history else []
+        if recent_dirs:
+            recent_call_ratio = sum(1 for d in recent_dirs if d == 1) / len(recent_dirs)
+        else:
+            recent_call_ratio = 0.5
+
+        # ── v3: Portfolio scan — evaluate ALL ready symbols simultaneously ─
+        # Build a candidate list of signals that pass all quality gates.
+        # PortfolioAllocator then assigns stakes across them by edge × confidence
+        # × correlation adjustment rather than picking just one winner.
+        portfolio_candidates = []
+        # v7: symbol -> minute duration, populated by Gate 6 below when the
+        # LSTM minute-bar model wins the sweep with a confident edge for
+        # that symbol. Kept out of the portfolio_candidates tuple shape
+        # (PortfolioAllocator doesn't need to know about it) and looked up
+        # again at execution time below.
+        lstm_minute_overrides: Dict[str, int] = {}
+        # v8: which pipeline originated each symbol's chosen candidate --
+        # the execution loop below needs this to pick the right ATOMIC
+        # final recheck immediately before firing (tick-based Gate 1 for
+        # a tick_gates candidate; a fresh LSTM re-evaluation for an
+        # lstm_standalone one -- Gates 1-5 never applied to those, so
+        # re-checking Gate 1 on them would be checking the wrong thing).
+        candidate_source: Dict[str, str] = {}
+        # v13 BUGFIX: which regime (if any) the candidate's Gate 1 pass at
+        # scan time was scoped to. The atomic recheck immediately before
+        # firing must re-verify Gate 1 over the SAME layer subset, or it's
+        # not really re-checking the same thing -- see the "blocked at
+        # execution" fix below.
+        candidate_regime: Dict[str, Optional[str]] = {}
+        # Conviction-derived stake per symbol (asymmetric sizing).
+        # Empty/None entries mean "no regime opinion, use allocator".
+        conviction_stake_by_symbol: Dict[str, float] = {}
+        # Raw conviction score per symbol (0..1, None if regime routing
+        # didn't produce one for this candidate) -- used below to decide
+        # whether a loss on this symbol is allowed to arm martingale.
+        conviction_by_symbol: Dict[str, float] = {}
+
+        for s in ready_symbols:
+            # Skip symbols already holding an open position, and symbols
+            # with an active recovery obligation (v12) -- a recovering
+            # symbol is paused from fresh normal-scan entries until its own
+            # recovery slot clears, even though other symbols keep scanning
+            # normally in the same cycle.
+            if s in state.open_positions or s in state.recovery:
+                continue
+
+            sd    = symbol_data[s]
+            feats = compute_features(sd, state.model_cache.get(s), returns_window_dict)
+            if feats is None:
+                continue
+            feats["recent_call_ratio"] = recent_call_ratio
+
+            # v3: Run drift check on live signal (KS + PSI). Kept even
+            # though the tick-gate trading pipeline itself is gone (v10)
+            # -- this still monitors whether the tick-level signal
+            # distribution is drifting, which feeds drift-triggered
+            # recalibration regardless of which duration_unit actually
+            # trades.
+            live_returns = sd.returns()
+            p_up, confidence = fuse_signal(feats, state, s)
+            DriftDetector.check_all(state, s, live_returns, float(confidence))
+
+            def try_minute_gates_candidate():
+                """v9: the SAME Gates 1-6 + Monte Carlo pipeline as
+                try_tick_candidate() above, reused completely unmodified
+                but fed MINUTE-bar data via MinuteBarView instead of raw
+                ticks (see that adapter's docstring for why this is safe
+                -- every one of these functions was audited to confirm it
+                only touches its data through an interface MinuteBarView
+                also implements). This is the PRIMARY path in the v9
+                architecture: tried BEFORE everything else below, not
+                after. Returns a qualified candidate dict (always
+                duration_unit="m"), or None if minute data/models aren't
+                ready yet for this symbol or any gate rejects it -- either
+                way the caller falls through to the LSTM-standalone /
+                tick-gate fallback logic below, unchanged from before."""
+                mv = MinuteBarView(sd)
+                if not mv.has_data(60):
+                    return None
+                m_models = state.minute_model_cache.get(s)
+                if m_models is None:
+                    return None
+
+                feats_m = compute_features(mv, m_models, minute_returns_window_dict)
+                if feats_m is None:
+                    return None
+                feats_m["recent_call_ratio"] = recent_call_ratio
+
+                p_up_m, confidence_m = fuse_signal(feats_m, state, s)
+                direction_m = 1 if p_up_m > 0.5 else -1
+                minute_returns = mv.returns()
+
+                # ── PHILOSOPHY CHANGE: regime-conditional routing +
+                #    asymmetric conviction sizing (see regime_conviction.py).
+                #    Runs BEFORE every other gate and can veto outright.
+                #
+                #    This replaces the ensemble-consensus premise for BOTH
+                #    direction and size. Instead of all 17 layers voting
+                #    equally in every market, we classify the regime first
+                #    and consult only the layers whose assumptions currently
+                #    hold — a mean-reversion layer during a trend is not
+                #    just noise, it is bias, and averaging it in drags p_up
+                #    toward a reversion that is not coming.
+                #
+                #    If the regime module says trade, its direction OVERRIDES
+                #    the fused consensus direction, and its conviction sets
+                #    the stake. If it says no, this cycle produces no trade
+                #    at all — no fallback to consensus, because falling back
+                #    to the thing we just replaced would defeat the change.
+                regime_res = None
+                if REGIME_ROUTING_ENABLED:
+                    sigma_now_m = float(np.std(minute_returns[-30:])) \
+                        if len(minute_returns) >= 30 else 0.0
+                    sigma_base_m = float(np.median([
+                        abs(r) for r in minute_returns[-200:]
+                    ])) * 1.253 if len(minute_returns) >= 60 else 0.0
+
+                    # Base stake for conviction scaling. Deliberately uses
+                    # MIN_STAKE, not balance * STAKE_PCT.
+                    #
+                    # The earlier version used balance*STAKE_PCT, which on a
+                    # $10k balance gave a $200 base — conviction then scaled
+                    # that to $184 against an allocator value of $0.35, a
+                    # 527x disagreement that only the ceiling caught. The
+                    # allocator's number already carries drift reduction,
+                    # loss-streak reduction, correlation and exposure
+                    # penalties; sizing conviction off raw balance discards
+                    # all of it and lets the ceiling silently do the risk
+                    # management instead of the risk logic.
+                    #
+                    # Anchoring on MIN_STAKE means conviction expresses a
+                    # multiple of the smallest sane trade, and the separate
+                    # allocator ceiling still bounds it against whatever the
+                    # risk stack decided independently.
+                    regime_res = regime_decision(
+                        hurst=feats_m.get("hurst", 0.5),
+                        sigma_now=sigma_now_m,
+                        sigma_baseline=sigma_base_m,
+                        layer_votes=feats_m["layer_votes"],
+                        base_stake=MIN_STAKE,
+                        cfg=REGIME_CFG,
+                    )
+                    for _r in regime_res["reasons"]:
+                        print(f"[Regime/{s}] {_r}")
+
+                    if not regime_res["trade"]:
+                        print(f"[Regime/{s}] no trade this cycle")
+                        return None
+
+                    # Consensus direction is kept even when the regime's
+                    # active-layer subset disagrees. Regime routing still
+                    # gates whether this cycle trades at all, and still
+                    # sets the conviction-scaled stake — only the direction
+                    # call itself is left to the fused consensus.
+                    if regime_res["direction"] != 0 and regime_res["direction"] != direction_m:
+                        print(f"[Regime/{s}] direction disagreement: consensus says "
+                              f"{'CALL' if direction_m > 0 else 'PUT'}, regime says "
+                              f"{'CALL' if regime_res['direction'] > 0 else 'PUT'} "
+                              f"— keeping consensus")
+
+                mc_duration_m, exp_win_rate_m = monte_carlo_duration(
+                    mv.prices(), minute_returns, direction_m, feats_m,
+                    CANDIDATE_DURATIONS_MINUTES, models=m_models
+                )
+                if exp_win_rate_m < MIN_EXP_WIN_RATE:
+                    # v15 BUGFIX: completely silent reject -- every other
+                    # gate below this one prints a reason when it skips a
+                    # candidate; this one didn't. That made this check
+                    # invisible to log-based diagnosis: a candidate could
+                    # clear regime_decision()'s conviction floor (which DOES
+                    # print its stake) and then die here with no trace at
+                    # all, indistinguishable in the log from "nothing
+                    # happened this cycle." Confirmed directly in production
+                    # logs: of 110 candidates that cleared the conviction
+                    # floor in one session, 95 had no visible rejection
+                    # anywhere afterward -- this was the only ungated,
+                    # unprinted exit between "stake computed" and a trade
+                    # actually firing. This is an independent, legitimate
+                    # check (the MC simulation's own expected win rate for
+                    # the chosen direction, separate from regime conviction's
+                    # layer-agreement measure) -- printing it doesn't change
+                    # what it rejects, only whether that rejection is
+                    # visible for tuning MIN_EXP_WIN_RATE against real data.
+                    print(f"[MC/Minute] {s} skipped — exp_win_rate="
+                          f"{exp_win_rate_m:.3f} < {MIN_EXP_WIN_RATE} "
+                          f"(regime conviction may have cleared its own "
+                          f"floor upstream; this MC check is independent "
+                          f"and still vetoes)")
+                    return None
+
+                # v15: MINIMAL_FILTER_MODE skips Gates 1, 4, 6 (layer
+                # agreement, bootstrap meta-ensemble, LSTM veto) -- see that
+                # constant's comment for the trade-off. Gates 2 (entropy),
+                # 3 (confluence), and 5 (advanced HMM/GBM borderline check)
+                # stay active in this mode, all on request: none of the
+                # three read anything Gates 1/4/6 compute (entropy and
+                # confluence only need price data and direction_m; Gate 5
+                # only needs the cached HMM model, confidence, and
+                # reliability/threshold state), so each works correctly
+                # standalone. Deliberately still skips record_gate_vote()/
+                # maybe_recalibrate_gate() (Gate 1 specific), so the
+                # autotune system's data stays clean for whenever this mode
+                # is turned back off.
+                if MINIMAL_FILTER_MODE:
+                    pe_ok, pe_score = entropy_gate_passes(mv.prices())
+                    if not pe_ok:
+                        print(f"[EntropyGate/Minute] {s} skipped — PE={pe_score:.3f} >= {PE_THRESHOLD}")
+                        return None
+                    tf_agree, tf_dirs = multi_timeframe_confluence(mv.prices(), direction_m)
+                    if tf_agree < MIN_TF_AGREEMENT:
+                        print(f"[Confluence/Minute] {s} skipped — only {tf_agree}/3 TFs agree {tf_dirs}")
+                        return None
+
+                    # Gate 5, same semantics as the full pipeline below:
+                    # only BLOCKS when the layer stack's own signal is
+                    # borderline AND the advanced MC disagrees on direction;
+                    # otherwise it's diagnostic-only (see the v5/v6 version
+                    # notes at the top of this file for why a hard
+                    # required-agreement version over-rejected).
+                    mc_scan_m = hmm_gbm_scan(mv.prices(), minute_returns, CANDIDATE_DURATIONS_MINUTES,
+                                             hmm_model=getattr(m_models, "hmm_model", None))
+                    sym_score_m = confidence_m * state.reliability.get(s, 1.0)
+                    sym_thr_m   = state.per_symbol_threshold.get(s, state.adaptive_threshold)
+                    sym_borderline_m = sym_score_m < MC_BORDERLINE_MULTIPLIER * sym_thr_m
+                    if mc_scan_m["direction"] != direction_m and sym_borderline_m:
+                        print(f"[MC/Minute] {s} skipped — BORDERLINE signal "
+                              f"(score={sym_score_m:.3f} < {MC_BORDERLINE_MULTIPLIER}x "
+                              f"threshold={sym_thr_m:.3f}) and advanced MC disagrees -- "
+                              f"leans {'CALL' if mc_scan_m['direction']>0 else 'PUT'} "
+                              f"(p={mc_scan_m['p']:.3f}) vs minute layer stack's "
+                              f"{'CALL' if direction_m>0 else 'PUT'}")
+                        return None
+
+                    return {
+                        "source": "minute_gates",
+                        "direction": direction_m,
+                        "p_up": float(p_up_m),
+                        "confidence": float(confidence_m),
+                        "exp_win_rate": float(exp_win_rate_m),
+                        "rating": abs(float(p_up_m) - 0.5),
+                        "duration": mc_duration_m,
+                        "exec_duration": mc_duration_m,
+                        "duration_unit": "m",
+                        "regime": regime_res["regime"] if regime_res else None,
+                        "conviction": regime_res["conviction"] if regime_res else None,
+                        "conviction_stake": regime_res["stake"] if regime_res else None,
+                    }
+
+                # Gate 1: Layer agreement — counted over the REGIME's active
+                # layer set when routing is on, so the layers the router
+                # deliberately ignored cannot veto through this gate.
+                _gate_regime = regime_res["regime"] if regime_res else None
+                gate_ok, n_agree, n_disagree, n_neutral = passes_layer_gate(
+                    feats_m, direction_m, regime=_gate_regime)
+                # v10: this is now the ONLY signal source feeding the
+                # adaptive gate-threshold recalibration system (record_
+                # gate_vote()/maybe_recalibrate_gate()) -- the tick-gate
+                # pipeline that used to feed it is gone. Without this call
+                # here, MIN_LAYER_AGREE/MAX_LAYER_DISAGREE would freeze at
+                # whatever they were when this bot last ran tick trades
+                # and never adapt again.
+                record_gate_vote(state, n_agree, n_disagree, feats_m["n_layers"])
+                maybe_recalibrate_gate(state)
+                if not gate_ok:
+                    if _gate_regime:
+                        print(f"[Gate/Minute] {s} skipped — regime-scoped layer vote "
+                              f"{n_agree} agree / {n_disagree} disagree / {n_neutral} neutral "
+                              f"(counted over {_gate_regime}'s active layers only)")
+                    else:
+                        print(f"[Gate/Minute] {s} skipped — layer vote {n_agree} agree / "
+                              f"{n_disagree} disagree / {n_neutral} neutral "
+                              f"(need >={MIN_LAYER_AGREE} agree, <={MAX_LAYER_DISAGREE} disagree)")
+                    return None
+
+                # Gate 2: Permutation entropy
+                pe_ok, pe_score = entropy_gate_passes(mv.prices())
+                if not pe_ok:
+                    print(f"[EntropyGate/Minute] {s} skipped — PE={pe_score:.3f} >= {PE_THRESHOLD}")
+                    return None
+
+                # Gate 3: Multi-timeframe confluence
+                tf_agree, tf_dirs = multi_timeframe_confluence(mv.prices(), direction_m)
+                if tf_agree < MIN_TF_AGREEMENT:
+                    print(f"[Confluence/Minute] {s} skipped — only {tf_agree}/3 TFs agree {tf_dirs}")
+                    return None
+
+                # Gate 4: Bootstrap meta-ensemble agreement
+                bs_agrees, bs_p = meta_ensemble_agrees(minute_returns, direction_m,
+                                                       mc_duration_m, exp_win_rate_m)
+                if not bs_agrees:
+                    print(f"[MetaEnsemble/Minute] {s} skipped — bootstrap p={bs_p:.3f} vs "
+                          f"parametric p={exp_win_rate_m:.3f} disagree by >{BOOTSTRAP_AGREE_TOL}")
+                    return None
+
+                # Gate 5: advanced HMM/GBM Monte Carlo, minute-scale
+                mc_scan_m = hmm_gbm_scan(mv.prices(), minute_returns, CANDIDATE_DURATIONS_MINUTES,
+                                         hmm_model=getattr(m_models, "hmm_model", None))
+                sym_score_m = confidence_m * state.reliability.get(s, 1.0)
+                sym_thr_m   = state.per_symbol_threshold.get(s, state.adaptive_threshold)
+                sym_borderline_m = sym_score_m < MC_BORDERLINE_MULTIPLIER * sym_thr_m
+                if mc_scan_m["direction"] != direction_m:
+                    if sym_borderline_m:
+                        print(f"[MC/Minute] {s} skipped — BORDERLINE signal "
+                              f"(score={sym_score_m:.3f} < {MC_BORDERLINE_MULTIPLIER}x "
+                              f"threshold={sym_thr_m:.3f}) and advanced MC disagrees -- "
+                              f"leans {'CALL' if mc_scan_m['direction']>0 else 'PUT'} "
+                              f"(p={mc_scan_m['p']:.3f}) vs minute layer stack's "
+                              f"{'CALL' if direction_m>0 else 'PUT'}")
+                        return None
+                    print(f"[MC/Minute] {s}: advanced MC leans "
+                          f"{'CALL' if mc_scan_m['direction']>0 else 'PUT'} "
+                          f"(p={mc_scan_m['p']:.3f}, signal is strong -- "
+                          f"score={sym_score_m:.3f} >= {MC_BORDERLINE_MULTIPLIER}x threshold, "
+                          f"so this is diagnostic only) vs minute layer stack's "
+                          f"{'CALL' if direction_m>0 else 'PUT'} -- proceeding on the minute "
+                          f"layer stack's pick regardless.")
+
+                # Gate 6: RISEFALL LSTM ensemble hard veto -- same policy as
+                # the tick pipeline's Gate 6. Uses the ORIGINAL tick-based
+                # `sd` since lstm_evaluate() already looks at both tick and
+                # minute windows internally and prioritizes minute (see
+                # lstm_duration_scan()) -- it doesn't need a MinuteBarView.
+                lstm_best_m = lstm_evaluate(sd)
+                if lstm_best_m is not None and lstm_best_m["direction"] != direction_m:
+                    print(f"[LSTM/Minute] {s} skipped -- ensemble leans "
+                          f"{'CALL' if lstm_best_m['direction']>0 else 'PUT'} "
+                          f"(p={lstm_best_m['p']:.3f} p_std={lstm_best_m['p_std']:.3f}) vs minute "
+                          f"layer stack's {'CALL' if direction_m>0 else 'PUT'} -- Gate 6 is a "
+                          f"hard veto.")
+                    return None
+
+                return {
+                    "source": "minute_gates",
+                    "direction": direction_m,
+                    "p_up": float(p_up_m),
+                    "confidence": float(confidence_m),
+                    "exp_win_rate": float(exp_win_rate_m),
+                    "rating": abs(float(p_up_m) - 0.5),
+                    "duration": mc_duration_m,
+                    "exec_duration": mc_duration_m,
+                    "duration_unit": "m",
+                    # Regime-routing outputs. conviction_stake is what the
+                    # execution path should actually stake — it is the whole
+                    # point of the asymmetric-sizing half of this change.
+                    # None when REGIME_ROUTING is disabled, in which case
+                    # the caller falls back to normal stake sizing.
+                    "regime": regime_res["regime"] if regime_res else None,
+                    "conviction": regime_res["conviction"] if regime_res else None,
+                    "conviction_stake": regime_res["stake"] if regime_res else None,
+                }
+
+            # v10: MINUTES ONLY. No tick fallback anywhere in this bot
+            # anymore -- if nothing confidently qualifies in minutes this
+            # cycle, the bot WAITS (skips this symbol this cycle), it does
+            # not downgrade to a tick trade. try_tick_candidate() and
+            # try_tick_recovery_candidate() are still defined above (dead
+            # code, kept only as reference/rollback material) but are
+            # never called from here.
+            minute_gates_candidate = try_minute_gates_candidate()
+
+            if minute_gates_candidate is not None:
+                chosen = minute_gates_candidate
+                print(f"[Minute] {s}: minute-native Gates 1-6 + MC pipeline qualifies on its "
+                      f"own (p={chosen['p_up']:.3f} rating={chosen['rating']:.3f}) -- trading "
+                      f"it directly.")
+            else:
+                # No confident minute-native Gates+MC read this cycle --
+                # LSTM standalone gets one more independent shot, but ONLY
+                # counts if ITS pick is also minute-duration. A tick-
+                # duration LSTM pick is not a fallback anymore -- it's
+                # simply not a qualifying candidate, full stop.
+                lstm_standalone = lstm_evaluate(sd)
+                if (lstm_standalone is not None
+                        and lstm_standalone["duration_unit"] == "m"
+                        and lstm_standalone["edge"] >= LSTM_MIN_EDGE_STANDALONE):
+                    chosen = {
+                        "source": "lstm_standalone",
+                        "direction": lstm_standalone["direction"],
+                        "p_up": lstm_standalone["p"],
+                        "confidence": min(1.0, lstm_standalone["edge"] * 2.0),
+                        "exp_win_rate": lstm_standalone["p"],
+                        "rating": lstm_standalone["edge"],
+                        "duration": lstm_standalone["duration"],
+                        "exec_duration": lstm_standalone["duration"],
+                        "duration_unit": "m",
+                    }
+                    print(f"[LSTM] {s}: minute-priority pick clears the bar on its own "
+                          f"(p={chosen['p_up']:.3f} edge={chosen['rating']:.3f}) -- trading it "
+                          f"directly.")
+                else:
+                    # Nothing qualified in minutes this cycle -- wait.
+                    continue
+
+            direction = chosen["direction"]
+            duration = chosen["duration"]
+            candidate_source[s] = chosen["source"]
+            candidate_regime[s] = chosen.get("regime")
+            if chosen.get("conviction_stake"):
+                conviction_stake_by_symbol[s] = float(chosen["conviction_stake"])
+            if chosen.get("conviction") is not None:
+                conviction_by_symbol[s] = float(chosen["conviction"])
+            lstm_minute_overrides[s] = int(chosen["exec_duration"])
+
+            # Passed all gates — add to portfolio candidates
+            portfolio_candidates.append(
+                (s, direction, float(chosen["p_up"]), float(chosen["confidence"]),
+                 float(chosen["exp_win_rate"]), int(duration))
+            )
+
+        if not portfolio_candidates:
+            continue
+
+        # Sort by confidence × reliability descending so allocator processes
+        # strongest signals first (correlation penalty uses insertion order)
+        portfolio_candidates.sort(
+            key=lambda c: c[3] * state.reliability.get(c[0], 1.0),
+            reverse=True
+        )
+
+        # ── v3: Portfolio allocation ───────────────────────────────────────
+        allocations = PortfolioAllocator.allocate(
+            portfolio_candidates, state, symbol_data, state.balance
+        )
+        if not allocations:
+            continue
+
+        # Execute each allocation — fire trades concurrently. Each symbol's
+        # full lifecycle (atomic recheck, open, await settlement, win/loss
+        # bookkeeping) is wrapped in _fire() below so asyncio.gather() can
+        # run them together instead of one full contract duration at a
+        # time. Previously this was a plain `for` loop awaiting
+        # execute_single_step() directly -- syntactically simultaneous per
+        # the comment that used to sit here, but actually sequential: each
+        # iteration blocked for that symbol's whole contract duration
+        # before the next one was even placed, which is why a "3 positions"
+        # allocation often only actually resulted in 1 trade -- the 2nd and
+        # 3rd legs' atomic rechecks would fail because the signal had moved
+        # in the minutes spent waiting on the 1st leg.
+        async def _fire(symbol, direction, base_stake, duration):
+            sd     = symbol_data[symbol]
+            source = candidate_source.get(symbol, "minute_gates")
+
+            # ── Asymmetric conviction sizing ────────────────────────────
+            # The allocator sized this on confidence × reliability. If the
+            # regime router produced a conviction stake, that OVERRIDES it:
+            # conviction is the sizing signal in this philosophy, and
+            # letting the allocator's number stand would silently discard
+            # the asymmetric half of the change. The allocator's value is
+            # kept as a ceiling though — its correlation/exposure penalties
+            # exist to stop several correlated symbols firing large at once,
+            # and conviction sizing has no view on cross-symbol exposure.
+            _conv_stake = conviction_stake_by_symbol.get(symbol)
+            if _conv_stake is not None and _conv_stake > 0:
+                _capped = min(_conv_stake, base_stake * CONVICTION_ALLOC_CEILING)
+                print(f"[Conviction/{symbol}] stake ${base_stake:.2f} (allocator) "
+                      f"-> ${_conv_stake:.2f} (conviction) "
+                      f"-> ${_capped:.2f} (after {CONVICTION_ALLOC_CEILING}x "
+                      f"allocator ceiling)")
+                base_stake = max(MIN_STAKE, _capped)
+            if FIXED_STAKE > 0:
+                base_stake = FIXED_STAKE
+
+            feats = await asyncio.to_thread(
+                compute_features, sd, state.model_cache.get(symbol), returns_window_dict
+            )
+            if feats is None:
+                return
+
+            # v8/v9/v10: ATOMIC final recheck, immediately before firing --
+            # guards against the gate state having moved between the scan
+            # above and this execution loop. Which recheck applies depends
+            # on which pipeline actually originated this trade: minute-
+            # native Gates 1-6 gets its own Gate 1 re-verified on fresh
+            # minute-bar data; a standalone LSTM pick gets the ensemble
+            # itself re-verified. There is no third ("tick_gates") case
+            # anymore -- this bot is minutes-only.
+            #
+            # compute_features()/lstm_evaluate() below are CPU-bound with
+            # no internal await, so they're run via asyncio.to_thread()
+            # rather than called directly. Called directly, each leg's
+            # full synchronous recheck would run to completion before the
+            # next leg's _fire() even started its own -- with three legs
+            # each carrying an ~18-layer feature recompute, that easily
+            # staggers the last leg's actual buy_contract call seconds
+            # behind the first, well past the minute-bar moment the
+            # intelligence layer actually signalled on. Threading it lets
+            # all legs' rechecks genuinely overlap instead of queuing.
+            if source == "lstm_standalone":
+                recheck = await asyncio.to_thread(lstm_evaluate, sd)
+                if (recheck is None or recheck["direction"] != direction
+                        or recheck["edge"] < LSTM_MIN_EDGE_STANDALONE):
+                    print(f"[LSTM/Atomic] {symbol} blocked at execution -- ensemble's "
+                          f"read moved between scan and fire.")
+                    return
+                atomic_feats = None
+            elif source == "minute_gates":
+                mv_atomic = MinuteBarView(sd)
+                m_models_atomic = state.minute_model_cache.get(symbol)
+                if m_models_atomic is not None and mv_atomic.has_data(60):
+                    feats_minute_atomic = await asyncio.to_thread(
+                        compute_features, mv_atomic, m_models_atomic, minute_returns_window_dict
+                    )
+                else:
+                    feats_minute_atomic = None
+                # v13 BUGFIX: this recheck used to call passes_layer_gate()
+                # with no regime argument, which falls back to counting ALL
+                # 17 layers (see passes_layer_gate()'s docstring) even
+                # though the scan-time pass that qualified this candidate
+                # only required agreement across its regime's 6-7 active
+                # layers. That mismatch -- not genuine signal decay between
+                # scan and fire -- was the atomic recheck's real bar, and it
+                # was blocking the large majority of qualifying candidates
+                # (e.g. 24 of 27 in one production run). Re-checking the
+                # SAME gate the candidate actually passed means passing the
+                # same regime scope here.
+                _atomic_regime = candidate_regime.get(symbol)
+                gate_ok_m = (passes_layer_gate(feats_minute_atomic, direction,
+                                               regime=_atomic_regime)[0]
+                            if feats_minute_atomic is not None else False)
+                if not gate_ok_m:
+                    _regime_note = (f" over {_atomic_regime}'s active layers"
+                                    if _atomic_regime else "")
+                    print(f"[Minute/Atomic] {symbol} blocked at execution -- minute-native "
+                          f"read moved between scan and fire (data/model no longer available, "
+                          f"or Gate 1 no longer agrees{_regime_note}).")
+                    return
+                atomic_feats = None
+            else:
+                atomic_feats = feats
+
+            # Recover p_up and confidence for the selected symbol
+            p_up_sym = next((c[2] for c in portfolio_candidates if c[0] == symbol), 0.5)
+            conf_sym  = next((c[3] for c in portfolio_candidates if c[0] == symbol), 0.0)
+            score_sym = conf_sym * state.reliability.get(symbol, 1.0)
+
+            # v10: every qualifying candidate is minute-duration by
+            # construction now -- lstm_minute_overrides[symbol] just
+            # records which minute duration to actually execute, set
+            # unconditionally for every candidate that reaches
+            # portfolio_candidates (see the scan loop above).
+            exec_duration = lstm_minute_overrides.get(symbol, duration)
+            exec_unit     = "m"
+
+            # v15 BUGFIX: reset_sequence_accumulator/state.seq_* are now
+            # keyed by symbol (see TradeState.seq_stakes for the incident
+            # this fixes) -- concurrent symbols no longer share, and can no
+            # longer clobber, each other's sequence bookkeeping. The
+            # martingale recovery slot below (state.recovery) is a separate
+            # mechanism already keyed by originating symbol (v12), unaffected
+            # by this change.
+            conviction_sym = conviction_by_symbol.get(symbol)
+            reset_sequence_accumulator(state, symbol, state.balance, p_up_sym, conf_sym,
+                                       duration, duration_unit=exec_unit,
+                                       conviction=conviction_sym)
+
+            explain_signal(
+                symbol=symbol, direction=direction,
+                feats=feats, p_up=p_up_sym, confidence=conf_sym,
+                duration=duration, exp_win=next(
+                    (c[4] for c in portfolio_candidates if c[0] == symbol), 0.5),
+                score=score_sym
+            )
+
+            # Track in open_positions for portfolio allocator deduplication
+            state.open_positions[symbol] = {
+                "direction": direction,
+                "stake":     base_stake,
+                "open_time": time.time(),
+            }
+
+            won, _ = await execute_single_step(
+                client, state, symbol, direction, base_stake, 0,
+                duration=exec_duration, duration_unit=exec_unit,
+                feats=atomic_feats
+            )
+
+            # Remove from open positions after resolution
+            state.open_positions.pop(symbol, None)
+
+            if won:
+                # Clean win — record and reset sequence for this symbol
+                state.consecutive_losses[symbol] = 0
+                emit_sequence_summary(state, symbol, direction, True)
+            else:
+                cumulative = base_stake
+                next_stake = recovery_stake_for_loss(state, symbol, cumulative)
+                conv = conviction_by_symbol.get(symbol)
+                if (MARTINGALE_MAX_STEPS >= 1 and conv is not None
+                        and conv >= MARTINGALE_MIN_CONVICTION):
+                    # Always arms once conviction qualifies -- no longer
+                    # refuses to arm over stake size. Instead, the stake
+                    # itself is clamped to MARTINGALE_MAX_STAKE_PCT of
+                    # balance: recovery still fires, it just may not fully
+                    # recover the loss if the "full recovery" stake would
+                    # have exceeded that ceiling.
+                    cap = state.balance * MARTINGALE_MAX_STAKE_PCT
+                    clamped_stake = next_stake
+                    clamped = False
+                    if clamped_stake > cap:
+                        clamped_stake = round(max(MIN_STAKE, cap), 2)
+                        clamped = True
+                    state.recovery[symbol] = {
+                        "step": 1, "stake": clamped_stake, "committed": cumulative,
+                    }
+                    if clamped:
+                        print(f"[Recovery] {symbol} step=0 loss (conviction={conv:.3f} >= "
+                              f"{MARTINGALE_MIN_CONVICTION:.2f}) — recovery step=1 "
+                              f"stake={clamped_stake:.2f} (clamped from {next_stake:.2f}, "
+                              f"full recovery would exceed {MARTINGALE_MAX_STAKE_PCT:.0%} "
+                              f"of balance — this trade will not fully recover the loss "
+                              f"even if it wins)")
+                    else:
+                        print(f"[Recovery] {symbol} step=0 loss (conviction={conv:.3f} >= "
+                              f"{MARTINGALE_MIN_CONVICTION:.2f}) — recovery step=1 "
+                              f"stake={clamped_stake:.2f}")
+                else:
+                    if conv is None:
+                        reason = "no conviction score for this trade"
+                    else:
+                        reason = (f"conviction {conv:.3f} < "
+                                  f"{MARTINGALE_MIN_CONVICTION:.2f} required")
+                    state.consecutive_losses[symbol] += 1
+                    emit_sequence_summary(state, symbol, direction, False)
+                    print(f"[Recovery] {symbol} step=0 loss — not arming ({reason})")
+
+        fire_results = await asyncio.gather(
+            *[_fire(symbol, direction, base_stake, duration)
+              for symbol, direction, base_stake, duration in allocations],
+            return_exceptions=True
+        )
+        for (symbol, *_rest), result in zip(allocations, fire_results):
+            if isinstance(result, Exception):
+                print(f"[Portfolio] {symbol} leg raised {type(result).__name__}: {result} "
+                      f"— other concurrent legs were unaffected.")
+
+        # Portfolio fires all allocations above, then waits for the next
+        # main-loop scan cycle before re-evaluating symbols.
+        state.last_activity = time.time()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        raise
+    except Exception as e:
+        print(f"[main] Unhandled exception, restarting process in place: {type(e).__name__}: {e}")
+        sys.stdout.flush()
+        time.sleep(3)  # brief pause so a fast crash loop doesn't hammer the API
+        os.execv(sys.executable, [sys.executable] + sys.argv)
