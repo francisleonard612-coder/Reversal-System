@@ -325,7 +325,7 @@ def main():
     else:
         data = {}
         for p in a.data:
-            sym = os.path.basename(p).split("_")[0]
+            sym = os.path.basename(p).split("_60d")[0].split("_1m")[0]
             data[sym] = load_csv(p)
     days = {s: (v[0][-1] - v[0][0]) / 86400 for s, v in data.items()}
     jobs = [(a.repo, s, data, a.step, a.max_evals) for s in data]
