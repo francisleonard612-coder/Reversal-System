@@ -508,8 +508,8 @@ GATE_SCHEMA_VERSION = 7   # bumped: discard gates loosened by the starvation-bre
 # it shifts more of the filtering burden onto entropy/confluence/bootstrap.
 # Watch their rejection rates after this change; if they stay near-idle while
 # win rate degrades, the new gates need tightening, not this one loosening further.
-MIN_LAYER_AGREE    = int(os.getenv("MIN_LAYER_AGREE", "9"))
-MAX_LAYER_DISAGREE = int(os.getenv("MAX_LAYER_DISAGREE", "4"))
+MIN_LAYER_AGREE    = int(os.getenv("MIN_LAYER_AGREE", "12"))
+MAX_LAYER_DISAGREE = int(os.getenv("MAX_LAYER_DISAGREE", "2"))
 
 # ── Adaptive gate controller (v5) ───────────────────────────────────────────
 # Root cause of the 2026-07-29 near-zero-trade-frequency incident: MIN_LAYER_
@@ -584,6 +584,14 @@ MIN_P_EDGE = float(os.getenv("MIN_P_EDGE", "0.0"))
 # p_win must be >= stake/payout + MIN_EV_MARGIN. FALLBACK_P_EDGE applies only
 # when Deriv will not return a quote.
 MIN_EV_MARGIN   = float(os.getenv("MIN_EV_MARGIN", "0.0"))
+# Payout is NOT factored into the trade decision unless PAYOUT_CHECK=true.
+PAYOUT_CHECK    = os.getenv("PAYOUT_CHECK", "false").strip().lower() in ("1", "true", "yes")
+# Gate 1 thresholds (MIN_LAYER_AGREE / MAX_LAYER_DISAGREE) and MIN_EXP_WIN_RATE
+# stay exactly as configured unless GATE_AUTOTUNE=true. With it on, three
+# mechanisms rewrite them at runtime (percentile recalibration toward a 12%
+# pass rate, the starvation breaker, win-rate autotune) and the saved values
+# override the configured ones on the next restart.
+GATE_AUTOTUNE   = os.getenv("GATE_AUTOTUNE", "false").strip().lower() in ("1", "true", "yes")
 FALLBACK_P_EDGE = float(os.getenv("FALLBACK_P_EDGE", "0.03"))
 _edge_floor_last_log: Dict[str, float] = {}
 
@@ -3609,6 +3617,8 @@ def maybe_recalibrate_gate(state):
     gate check -- internally throttled by GATE_RECALIB_INTERVAL_SECS, except
     for the starvation breaker which can fire early."""
     global MIN_LAYER_AGREE, MAX_LAYER_DISAGREE
+    if not GATE_AUTOTUNE:
+        return
     now = time.time()
     starved = (now - state.last_trade_time) > GATE_STARVATION_SECS
     due     = (now - state.last_gate_recalib_time) > GATE_RECALIB_INTERVAL_SECS
@@ -3686,6 +3696,8 @@ def maybe_recalibrate_gate(state):
 # ---------------------------------------------------------------------------
 def autotune_gates(state):
     global MIN_LAYER_AGREE, MAX_LAYER_DISAGREE, MIN_EXP_WIN_RATE
+    if not GATE_AUTOTUNE:
+        return
     # v15 BUGFIX: was summing state.step0_wins/step0_total, the LIFETIME
     # cumulative counters -- see TradeState.step0_recent_outcomes for why
     # that permanently locks the gates once a historically bad stretch
@@ -5402,7 +5414,10 @@ async def main():
         _store._upsert("bot_global_state", {"key": "state_schema_version",
                                             "value": json.dumps(STATE_SCHEMA_VERSION),
                                             "updated_at": datetime.utcnow().isoformat()})
-    gates = _store.load_gates()
+    gates = _store.load_gates() if GATE_AUTOTUNE else {}
+    if not GATE_AUTOTUNE:
+        print(f"[Gates] fixed: agree>={MIN_LAYER_AGREE} disagree<={MAX_LAYER_DISAGREE} "
+              f"MC>={MIN_EXP_WIN_RATE:.3f} (GATE_AUTOTUNE off)")
     if gates:
         MIN_LAYER_AGREE    = int(gates.get("min_layer_agree",    MIN_LAYER_AGREE))
         MAX_LAYER_DISAGREE = int(gates.get("max_layer_disagree", MAX_LAYER_DISAGREE))
@@ -6484,8 +6499,11 @@ async def main():
             # break-even 56.5%) against 1.886x (53.0%) on the volatility indices.
             _p_up = next((c[2] for c in portfolio_candidates if c[0] == symbol), 0.5)
             _p_win = _p_up if direction > 0 else 1.0 - _p_up
-            _quote = await quote_payout(client, symbol, direction, exec_duration, exec_unit, base_stake)
-            if _quote and _quote > base_stake:
+            _quote = (await quote_payout(client, symbol, direction, exec_duration, exec_unit, base_stake)
+                      if PAYOUT_CHECK else None)
+            if not PAYOUT_CHECK:
+                pass
+            elif _quote and _quote > base_stake:
                 _be = base_stake / _quote
                 _ok = _p_win >= _be + MIN_EV_MARGIN
                 print(f"[Quote/{symbol}] {'CALL' if direction > 0 else 'PUT'} {exec_duration}{exec_unit} "
