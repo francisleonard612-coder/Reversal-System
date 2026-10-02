@@ -4531,7 +4531,7 @@ async def execute_single_step(client, state, symbol, direction, stake, step, dur
         if not gate_ok:
             print(f"[Gate/Atomic] {symbol} step={step} blocked at execution — "
                   f"{n_agree} agree / {n_dis} disagree (gate moved between check and fire)")
-            return False, 0.0
+            return None, 0.0   # None = no trade was placed (not a loss)
 
     # FIX: with $0.09 left the bot retried a $0.35 buy every 3 seconds and
     # booked each rejected attempt as a lost trade (RDBEAR showed 6% over 36
@@ -4543,7 +4543,7 @@ async def execute_single_step(client, state, symbol, direction, stake, step, dur
             _low_balance_last_log["t"] = _now
             print(f"[Balance] {state.balance:.2f} is below the {stake:.2f} stake -- "
                   f"not trading until the account is topped up")
-        return False, 0.0
+        return None, 0.0   # None = no trade was placed (not a loss)
 
     state.trades_in_flight += 1
     try:
@@ -4555,7 +4555,7 @@ async def execute_single_step(client, state, symbol, direction, stake, step, dur
         except Exception as e:
             print(f"[Trade] Buy rejected on {symbol} step={step}: {e} -- no trade placed, nothing recorded")
             _buy_reject_until[symbol] = time.time() + 120
-            return False, 0.0
+            return None, 0.0   # None = no trade was placed (not a loss)
         try:
             # Convert the contract's own duration to seconds so the settle
             # timeout scales with the trade rather than using a fixed guess.
@@ -5862,6 +5862,8 @@ async def main():
                             duration=rec_exec_duration, duration_unit=rec_exec_unit,
                             feats=atomic_feats
                         )
+                        if won is None:
+                            return     # nothing was bought: neither a win nor a failed recovery step
                         if won:
                             print(f"[Recovery] {origin_symbol}'s recovery WON at "
                                   f"step={slot['step']} via {rec_sym} "
@@ -6552,6 +6554,8 @@ async def main():
             # Remove from open positions after resolution
             state.open_positions.pop(symbol, None)
 
+            if won is None:
+                return   # FIX: a trade that was never placed must not arm recovery or count as a loss
             if won:
                 # Clean win — record and reset sequence for this symbol
                 state.consecutive_losses[symbol] = 0
