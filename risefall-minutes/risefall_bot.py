@@ -578,9 +578,13 @@ MC_BORDERLINE_MULTIPLIER = 1.5   # score < 1.5x its threshold = borderline
 # 0.505 filters out clearly negative-edge scenarios while allowing the
 # layer-quality gate to do the primary selection work.
 MIN_EXP_WIN_RATE = float(os.getenv("MIN_EXP_WIN_RATE", "0.505"))
-# Minimum |calibrated p_up - 0.5| to trade. 0.03 = the ~53% break-even at a
-# 1.886x payout. Set MIN_P_EDGE=0 to trade on any lean (the original behaviour).
-MIN_P_EDGE = float(os.getenv("MIN_P_EDGE", "0.03"))
+# Optional static pre-filter on |calibrated p_up - 0.5| (0 = off).
+MIN_P_EDGE = float(os.getenv("MIN_P_EDGE", "0.0"))
+# The real gate is the live payout check just before buying (see quote_payout):
+# p_win must be >= stake/payout + MIN_EV_MARGIN. FALLBACK_P_EDGE applies only
+# when Deriv will not return a quote.
+MIN_EV_MARGIN   = float(os.getenv("MIN_EV_MARGIN", "0.0"))
+FALLBACK_P_EDGE = float(os.getenv("FALLBACK_P_EDGE", "0.03"))
 _edge_floor_last_log: Dict[str, float] = {}
 
 # ── Adaptive threshold percentile ─────────────────────────────────────────
@@ -1672,6 +1676,25 @@ async def buy_contract(client, symbol, direction, duration, duration_unit, stake
     if "error" in resp:
         raise RuntimeError(resp["error"].get("message", "buy failed"))
     return resp["buy"]["contract_id"]
+
+
+async def quote_payout(client, symbol, direction, duration, duration_unit, stake):
+    """Deriv's current payout (stake + profit) for this exact contract, or
+    None if it cannot be priced. Read-only: a proposal, not a purchase."""
+    try:
+        resp = await client.send({
+            "proposal": 1, "amount": stake, "basis": "stake",
+            "contract_type": "CALL" if direction > 0 else "PUT",
+            "currency": "USD", "duration": int(duration),
+            "duration_unit": duration_unit, "underlying_symbol": symbol,
+        })
+        if "error" in resp:
+            print(f"[Quote/{symbol}] proposal error: {resp['error'].get('message', resp['error'])}")
+            return None
+        return float(resp["proposal"]["payout"])
+    except Exception as e:
+        print(f"[Quote/{symbol}] proposal failed: {e}")
+        return None
 
 
 async def wait_for_contract_result(client, contract_id, duration_seconds=None):
@@ -6453,6 +6476,28 @@ async def main():
                     (c[4] for c in portfolio_candidates if c[0] == symbol), 0.5),
                 score=score_sym
             )
+
+            # PAYOUT-AWARE BREAK-EVEN CHECK. Ask Deriv what this exact contract
+            # pays right now and only buy if the calibrated win probability
+            # beats the break-even that payout implies. Payouts differ a lot by
+            # symbol and side: RDBULL Rise paid 0.27 on 0.35 overnight (1.77x,
+            # break-even 56.5%) against 1.886x (53.0%) on the volatility indices.
+            _p_up = next((c[2] for c in portfolio_candidates if c[0] == symbol), 0.5)
+            _p_win = _p_up if direction > 0 else 1.0 - _p_up
+            _quote = await quote_payout(client, symbol, direction, exec_duration, exec_unit, base_stake)
+            if _quote and _quote > base_stake:
+                _be = base_stake / _quote
+                _ok = _p_win >= _be + MIN_EV_MARGIN
+                print(f"[Quote/{symbol}] {'CALL' if direction > 0 else 'PUT'} {exec_duration}{exec_unit} "
+                      f"pays {_quote / base_stake:.3f}x -> break-even {_be:.3f}; p_win={_p_win:.3f} "
+                      f"-> {'BUY' if _ok else 'SKIP (below break-even)'}")
+                if not _ok:
+                    state.last_trade_time = time.time()   # a priced-out signal is not gate starvation
+                    return
+            elif abs(_p_up - 0.5) < FALLBACK_P_EDGE:
+                print(f"[Quote/{symbol}] no quote available and |p-0.5|={abs(_p_up - 0.5):.3f} "
+                      f"< {FALLBACK_P_EDGE} -- SKIP")
+                return
 
             # Track in open_positions for portfolio allocator deduplication
             state.open_positions[symbol] = {
