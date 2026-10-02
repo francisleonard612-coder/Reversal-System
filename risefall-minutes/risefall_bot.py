@@ -578,6 +578,10 @@ MC_BORDERLINE_MULTIPLIER = 1.5   # score < 1.5x its threshold = borderline
 # 0.505 filters out clearly negative-edge scenarios while allowing the
 # layer-quality gate to do the primary selection work.
 MIN_EXP_WIN_RATE = float(os.getenv("MIN_EXP_WIN_RATE", "0.505"))
+# Minimum |calibrated p_up - 0.5| to trade. 0.03 = the ~53% break-even at a
+# 1.886x payout. Set MIN_P_EDGE=0 to trade on any lean (the original behaviour).
+MIN_P_EDGE = float(os.getenv("MIN_P_EDGE", "0.03"))
+_edge_floor_last_log: Dict[str, float] = {}
 
 # ── Adaptive threshold percentile ─────────────────────────────────────────
 ADAPTIVE_THRESHOLD_PERCENTILE = 75
@@ -3640,6 +3644,8 @@ def maybe_recalibrate_gate(state):
           f"(targeting ~{GATE_TARGET_PASS_RATE:.0%} pass rate)")
 
     state.last_gate_recalib_time = now
+    if starved:
+        state.last_trade_time = now   # FIX: one starvation step per window (it stepped every scan: 6->4 / 1->8 in 30s)
     if changed:
         MIN_LAYER_AGREE, MAX_LAYER_DISAGREE = target_agree, target_dis
         if _store:
@@ -5962,6 +5968,20 @@ async def main():
                 p_up_m, confidence_m = fuse_signal(feats_m, state, s)
                 direction_m = 1 if p_up_m > 0.5 else -1
                 minute_returns = mv.returns()
+
+                # EDGE FLOOR. The calibrated probability must clear break-even
+                # before anything else is considered. Rise/Fall here pays about
+                # 0.31 on a 0.35 stake (1.886x), so break-even is ~53%: a trade
+                # at p=0.498 is a coin flip that loses the house margin. The
+                # first live night took 24 trades at |p-0.5| of 0.000-0.037
+                # (median 0.010) and won exactly half of them, for -0.56.
+                if abs(p_up_m - 0.5) < MIN_P_EDGE:
+                    _now = time.time()
+                    if _now - _edge_floor_last_log.get(s, 0.0) > 300:
+                        _edge_floor_last_log[s] = _now
+                        print(f"[EdgeFloor/{s}] p_up={p_up_m:.3f} -- |p-0.5|={abs(p_up_m - 0.5):.3f} "
+                              f"< {MIN_P_EDGE} (below break-even), no trade")
+                    return None
 
                 # ── PHILOSOPHY CHANGE: regime-conditional routing +
                 #    asymmetric conviction sizing (see regime_conviction.py).
