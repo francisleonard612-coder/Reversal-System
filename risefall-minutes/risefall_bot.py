@@ -594,6 +594,8 @@ PAYOUT_CHECK    = os.getenv("PAYOUT_CHECK", "false").strip().lower() in ("1", "t
 GATE_AUTOTUNE   = os.getenv("GATE_AUTOTUNE", "false").strip().lower() in ("1", "true", "yes")
 FALLBACK_P_EDGE = float(os.getenv("FALLBACK_P_EDGE", "0.03"))
 _edge_floor_last_log: Dict[str, float] = {}
+_low_balance_last_log: Dict[str, float] = {}
+_buy_reject_until: Dict[str, float] = {}
 
 # ── Adaptive threshold percentile ─────────────────────────────────────────
 ADAPTIVE_THRESHOLD_PERCENTILE = 75
@@ -4531,6 +4533,18 @@ async def execute_single_step(client, state, symbol, direction, stake, step, dur
                   f"{n_agree} agree / {n_dis} disagree (gate moved between check and fire)")
             return False, 0.0
 
+    # FIX: with $0.09 left the bot retried a $0.35 buy every 3 seconds and
+    # booked each rejected attempt as a lost trade (RDBEAR showed 6% over 36
+    # "trades", 34 of which never existed). Check the balance first, and treat
+    # a rejected buy as no trade.
+    if state.balance < stake:
+        _now = time.time()
+        if _now - _low_balance_last_log.get("t", 0.0) > 600:
+            _low_balance_last_log["t"] = _now
+            print(f"[Balance] {state.balance:.2f} is below the {stake:.2f} stake -- "
+                  f"not trading until the account is topped up")
+        return False, 0.0
+
     state.trades_in_flight += 1
     try:
         state.last_trade_time = time.time()   # v5: feeds the gate starvation breaker
@@ -4538,6 +4552,11 @@ async def execute_single_step(client, state, symbol, direction, stake, step, dur
         try:
             contract_id = await buy_contract(
                 client, symbol, direction, int(duration), duration_unit, stake)
+        except Exception as e:
+            print(f"[Trade] Buy rejected on {symbol} step={step}: {e} -- no trade placed, nothing recorded")
+            _buy_reject_until[symbol] = time.time() + 120
+            return False, 0.0
+        try:
             # Convert the contract's own duration to seconds so the settle
             # timeout scales with the trade rather than using a fixed guess.
             _dur_secs = float(duration) * (60.0 if duration_unit == "m" else 2.0)
